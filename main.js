@@ -10,6 +10,8 @@ let nextSessionId = 1;
 let CLAUDE_BIN = null;
 let NPM_BIN = 'npm';
 let setupChild = null;
+let loginInFlight = false;
+let loginAttemptSeq = 0;
 
 const CLAUDE_PKG = '@anthropic-ai/claude-code';
 const IS_WIN = process.platform === 'win32';
@@ -516,45 +518,70 @@ function friendlyInstallError(raw, code) {
   return code ? `The installer stopped unexpectedly (code ${code}). Try again.` : 'The installer stopped unexpectedly. Try again.';
 }
 
+ipcMain.handle('log:debug', (_e, text) => {
+  if (typeof text === 'string' && text.length > 0) appendLog(text.endsWith('\n') ? text : text + '\n');
+});
+
 ipcMain.handle('setup:login', async () => {
-  if (setupChild) {
-    killChildTree(setupChild);
-    setupChild = null;
+  // HARD MUTEX. Two rapid-fire clicks (or two concurrent entry points — top-bar
+  // Sign in, setup flow, pre-send check — racing each other) would otherwise
+  // each spawn `claude auth login --claudeai`, each opening a browser tab with
+  // its own OAuth session. When the user pastes a code, it goes to whichever
+  // subprocess was assigned to setupChild last — usually the wrong one.
+  if (loginInFlight) {
+    appendLog(`\n[setup:login] REJECTED — another sign-in already in flight (attempt #${loginAttemptSeq})\n`);
+    return { ok: false, error: 'A sign-in is already in progress.', alreadyInFlight: true };
   }
-  logHeader('sign-in flow (claude auth login --claudeai)');
+  loginInFlight = true;
+  const attemptId = ++loginAttemptSeq;
+  logHeader(`sign-in attempt #${attemptId} — claude auth login --claudeai`);
   appendLog(`claude bin: ${CLAUDE_BIN}\n`);
 
-  const already = await checkAuthStatus();
-  appendLog(`pre-check: ${JSON.stringify(already)}\n`);
-  if (already.loggedIn) return { ok: true, auth: already };
+  try {
+    // Kill any leftover subprocess from a previous attempt (belt-and-suspenders).
+    if (setupChild) {
+      appendLog(`[attempt #${attemptId}] killing stray setupChild before starting\n`);
+      killChildTree(setupChild);
+      setupChild = null;
+    }
 
-  const result = await runAuthLogin();
-  appendLog(`\n--- runAuthLogin summary ---\nok=${result.ok} exitCode=${result.code ?? '?'} killedForAuth=${result.killedForAuth ?? false}\n`);
+    const already = await checkAuthStatus();
+    appendLog(`[attempt #${attemptId}] pre-check: ${JSON.stringify(already)}\n`);
+    if (already.loggedIn) return { ok: true, auth: already, attemptId };
 
-  const finalStatus = await checkAuthStatus();
-  appendLog(`post-login: ${JSON.stringify(finalStatus)}\n`);
-  if (finalStatus.loggedIn) return { ok: true, auth: finalStatus };
+    const result = await runAuthLogin(attemptId);
+    appendLog(`\n[attempt #${attemptId}] runAuthLogin summary: ok=${result.ok} exitCode=${result.code ?? '?'} killedForAuth=${result.killedForAuth ?? false}\n`);
 
-  const details = [
-    'Command: claude auth login --claudeai',
-    `Bin: ${CLAUDE_BIN}`,
-    `Exit code: ${result.code ?? '(killed)'}`,
-    `Killed by us after successful auth: ${result.killedForAuth ?? false}`,
-    '',
-    '--- Subprocess output (last 3KB) ---',
-    (result.combined || '(no output captured)').slice(-3000),
-    '',
-    '--- Final auth status probe ---',
-    JSON.stringify(finalStatus, null, 2),
-  ].join('\n');
+    const finalStatus = await checkAuthStatus();
+    appendLog(`[attempt #${attemptId}] post-login: ${JSON.stringify(finalStatus)}\n`);
+    if (finalStatus.loggedIn) return { ok: true, auth: finalStatus, attemptId };
 
-  return {
-    ok: false,
-    error: 'Sign-in did not complete. Please try again, or open the setup log for details.',
-    details,
-    logPath: getLogPath(),
-    authReason: finalStatus.reason,
-  };
+    const details = [
+      `Attempt #${attemptId}`,
+      'Command: claude auth login --claudeai',
+      `Bin: ${CLAUDE_BIN}`,
+      `Exit code: ${result.code ?? '(killed)'}`,
+      `Killed by us after successful auth: ${result.killedForAuth ?? false}`,
+      '',
+      '--- Subprocess output (last 3KB) ---',
+      (result.combined || '(no output captured)').slice(-3000),
+      '',
+      '--- Final auth status probe ---',
+      JSON.stringify(finalStatus, null, 2),
+    ].join('\n');
+
+    return {
+      ok: false,
+      error: 'Sign-in did not complete. Please try again, or open the setup log for details.',
+      details,
+      logPath: getLogPath(),
+      authReason: finalStatus.reason,
+      attemptId,
+    };
+  } finally {
+    loginInFlight = false;
+    appendLog(`[attempt #${attemptId}] setup:login handler released mutex\n`);
+  }
 });
 
 /**
@@ -569,9 +596,10 @@ ipcMain.handle('setup:login', async () => {
  * `claude auth status --json` for authoritative completion — the subprocess
  * exit code is treated as informational only.
  */
-function runAuthLogin() {
+function runAuthLogin(attemptId = '?') {
+  const tag = `[attempt #${attemptId}]`;
   return new Promise((resolve) => {
-    appendLog(`\n>>> spawn: ${CLAUDE_BIN} auth login --claudeai\n`);
+    appendLog(`\n${tag} >>> spawn: ${CLAUDE_BIN} auth login --claudeai\n`);
     let child;
     let settled = false;
     const finish = (payload) => {
@@ -604,7 +632,7 @@ function runAuthLogin() {
       const preferred = urls.find((u) => /anthropic|claude/i.test(u)) || urls[0];
       if (preferred) {
         urlOpened = true;
-        appendLog(`[detected url] ${preferred}\n`);
+        appendLog(`${tag} [detected url] ${preferred}\n`);
         shell.openExternal(preferred).catch(() => {});
         sendToRenderer('setup:progress', { phase: 'loggingIn', urlOpened: true, url: preferred });
       }
@@ -613,13 +641,13 @@ function runAuthLogin() {
     child.stdout.on('data', (d) => {
       const s = d.toString('utf8');
       combined += s;
-      appendLog(`[stdout] ${s}`);
+      appendLog(`${tag} [stdout] ${s}`);
       openUrlIfSeen();
     });
     child.stderr.on('data', (d) => {
       const s = d.toString('utf8');
       combined += s;
-      appendLog(`[stderr] ${s}`);
+      appendLog(`${tag} [stderr] ${s}`);
       openUrlIfSeen();
     });
 
@@ -629,7 +657,7 @@ function runAuthLogin() {
       if (settled) return;
       doneChecks++;
       const status = await checkAuthStatus();
-      appendLog(`[poll ${doneChecks}] loggedIn=${status.loggedIn} reason=${status.reason}\n`);
+      appendLog(`${tag} [poll ${doneChecks}] loggedIn=${status.loggedIn} reason=${status.reason}\n`);
       if (status.loggedIn) {
         clearInterval(checkInterval);
         killChildTree(child);
@@ -637,7 +665,7 @@ function runAuthLogin() {
         finish({ ok: true, code: null, combined, killedForAuth: true });
       } else if (doneChecks >= MAX_CHECKS) {
         clearInterval(checkInterval);
-        appendLog(`[timeout after ${MAX_CHECKS * 5}s]\n`);
+        appendLog(`${tag} [timeout after ${MAX_CHECKS * 5}s]\n`);
         killChildTree(child);
         setupChild = null;
         finish({ ok: false, code: null, combined });
@@ -647,17 +675,17 @@ function runAuthLogin() {
     child.on('error', (e) => {
       clearInterval(checkInterval);
       setupChild = null;
-      appendLog(`[child error] ${e.message}\n`);
+      appendLog(`${tag} [child error] ${e.message}\n`);
       finish({ ok: false, code: -1, combined: combined + '\n' + e.message });
     });
     child.on('close', async (code) => {
       clearInterval(checkInterval);
       setupChild = null;
-      appendLog(`[exit] code=${code} (after ${doneChecks} auth polls)\n`);
+      appendLog(`${tag} [exit] code=${code} (after ${doneChecks} auth polls)\n`);
       if (settled) return;
       // One last authoritative check — the CLI may exit before our poll fires.
       const status = await checkAuthStatus();
-      appendLog(`[final check] loggedIn=${status.loggedIn} reason=${status.reason}\n`);
+      appendLog(`${tag} [final check] loggedIn=${status.loggedIn} reason=${status.reason}\n`);
       finish({ ok: status.loggedIn, code, combined });
     });
   });

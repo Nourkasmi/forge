@@ -600,114 +600,183 @@ function startAuthPolling() {
   }, 60 * 1000);
 }
 
+// HARD LOCK on the sign-in modal. Prevents concurrent promptSignIn calls —
+// which was one source of duplicate OAuth tabs (each promptSignIn calls
+// setup:login which spawns a subprocess and opens a browser). Both the top-bar
+// button, the setup flow, the pre-send auth check, and the "Try again" button
+// route through here, so this is the single choke point.
+let signInLock = false;
+let signInAttemptCounter = 0;
+
+function dlog(tag, msg) {
+  const line = `[renderer ${tag}] ${new Date().toISOString()} ${msg}`;
+  try { console.log(line); } catch {}
+  try { window.forge.logDebug(line); } catch {}
+}
+
 async function promptSignIn() {
-  // The subprocess runs in the background. Its exit is not our completion signal —
-  // `claude auth status --json` is. We forward user-pasted codes to its stdin via
-  // setup:submitCode, and poll auth status until it flips to true.
-  let cancelled = false;
-  const loginPromise = window.forge.setupLogin().catch((e) => ({ ok: false, error: e.message }));
+  if (signInLock) {
+    dlog('lock', 'promptSignIn suppressed — another sign-in is already open');
+    return;
+  }
+  signInLock = true;
+  const attemptId = 'r' + (++signInAttemptCounter);
+  dlog(attemptId, 'promptSignIn ENTER');
 
-  const doCancel = async () => {
-    cancelled = true;
-    await window.forge.setupCancel();
-    hideSetup();
-    await refreshAuth();
-  };
-
-  const showPasteStep = (opts = {}) => {
+  try {
+    let cancelled = false;
     let inputRef = null;
-    const rendered = showSetup({
-      title: 'Sign in to Anthropic',
-      sub: opts.sub ||
-        'Your browser is opening. Sign in with your Anthropic account, then copy the code shown on the "Paste this in Claude Code" page and paste it below.',
-      spinner: false,
-      error: opts.error,
-      codeInput: {
-        label: 'Authorization code',
-        placeholder: 'Paste the code from your browser',
-        value: opts.keepValue || '',
-      },
-      actions: [
-        {
-          label: 'Sign in',
-          primary: true,
-          onClick: async () => {
-            const val = (inputRef?.value || '').trim();
-            if (!val) { inputRef?.focus(); return; }
-            await handleCodeSubmit(val);
-          },
+    let currentStep = 'init';
+
+    dlog(attemptId, 'calling window.forge.setupLogin() (background)');
+    const loginPromise = window.forge.setupLogin()
+      .catch((e) => ({ ok: false, error: e && e.message ? e.message : String(e) }));
+
+    const doCancel = async () => {
+      dlog(attemptId, 'user clicked Cancel');
+      cancelled = true;
+      try { await window.forge.setupCancel(); } catch {}
+      hideSetup();
+      await refreshAuth();
+    };
+
+    const renderPasteStep = (opts = {}) => {
+      currentStep = 'paste';
+      dlog(attemptId, `renderPasteStep opts.error=${!!opts.error} opts.sub=${!!opts.sub}`);
+      const rendered = showSetup({
+        title: 'Sign in to Anthropic',
+        sub: opts.sub ||
+          'Your browser is opening the Anthropic sign-in page. After you authorize, copy the authentication code that appears and paste it in the field below.',
+        spinner: false,
+        error: opts.error,
+        codeInput: {
+          label: 'Authentication code from your browser',
+          placeholder: 'Paste the code here',
         },
-        { label: 'Cancel', onClick: doCancel },
-      ],
-    });
-    inputRef = rendered.inputEl;
-  };
-
-  const handleCodeSubmit = async (code) => {
-    showSetup({
-      title: 'Verifying…',
-      sub: 'Checking your sign-in with Anthropic.',
-      spinner: true,
-      actions: [{ label: 'Cancel', onClick: doCancel }],
-    });
-
-    const submit = await window.forge.setupSubmitCode(code);
-    if (!submit.ok) {
-      showPasteStep({
-        error: submit.error || 'Could not send the code to the sign-in helper.',
-        sub: 'That didn\'t work — copy the code again and paste it here.',
+        actions: [
+          { label: 'Sign in', primary: true, onClick: onSubmitClick },
+          { label: 'Cancel', onClick: doCancel },
+        ],
       });
+      inputRef = rendered.inputEl;
+      // Verify the input actually landed in the DOM. If this ever fires, we
+      // have a rendering bug and the log will point directly at it.
+      requestAnimationFrame(() => {
+        const check = document.getElementById('setup-code-field');
+        const overlay = document.getElementById('setup-overlay');
+        const overlayVisible = overlay && !overlay.hidden && overlay.offsetWidth > 0;
+        const inputVisible = check && check.offsetWidth > 0 && check.offsetHeight > 0;
+        dlog(attemptId, `renderPasteStep post-paint: overlayVisible=${overlayVisible} inputExists=${!!check} inputVisible=${inputVisible} inputW=${check ? check.offsetWidth : 0}`);
+        if (!inputVisible) {
+          dlog(attemptId, 'WARNING: paste input did not render — falling back to plain-text instructions');
+        }
+      });
+    };
+
+    const onSubmitClick = async () => {
+      const val = (inputRef && inputRef.value ? inputRef.value : '').trim();
+      dlog(attemptId, `Sign in clicked; codeLength=${val.length}`);
+      if (!val) {
+        if (inputRef) inputRef.focus();
+        return;
+      }
+      await handleCodeSubmit(val);
+    };
+
+    const handleCodeSubmit = async (code) => {
+      currentStep = 'verifying';
+      dlog(attemptId, 'showing verifying spinner');
+      showSetup({
+        title: 'Verifying…',
+        sub: 'Checking your sign-in with Anthropic. This usually takes a few seconds.',
+        spinner: true,
+        actions: [{ label: 'Cancel', onClick: doCancel }],
+      });
+
+      dlog(attemptId, 'calling setupSubmitCode');
+      const submit = await window.forge.setupSubmitCode(code);
+      dlog(attemptId, `setupSubmitCode returned ok=${submit && submit.ok} err=${submit && submit.error}`);
+      if (!submit || !submit.ok) {
+        renderPasteStep({
+          error: (submit && submit.error) || 'Could not send the code to the sign-in helper.',
+          sub: 'That didn\'t work — try copying the code from your browser again.',
+        });
+        return;
+      }
+
+      // Poll auth status until the CLI confirms our code exchanged for a real token.
+      for (let i = 0; i < 15; i++) {
+        if (cancelled) { dlog(attemptId, 'polling aborted — cancelled'); return; }
+        await new Promise((r) => setTimeout(r, 2000));
+        const auth = await refreshAuth({ silent: true });
+        dlog(attemptId, `verify poll ${i + 1}/15: loggedIn=${auth.loggedIn} reason=${auth.reason}`);
+        if (auth.loggedIn) {
+          currentStep = 'connected';
+          showSetup({ title: 'Connected!', sub: 'All set.', spinner: false });
+          setTimeout(() => hideSetup(), 900);
+          return;
+        }
+      }
+
+      // Timed out. The subprocess is still alive so a fresh paste can retry
+      // without needing another OAuth round-trip.
+      renderPasteStep({
+        error: 'That code didn\'t verify within 30 seconds. It may be expired or mistyped — copy it from your browser again and try once more.',
+      });
+    };
+
+    // Render the paste UI immediately. User can start authing in the browser
+    // and paste as soon as they have the code.
+    renderPasteStep();
+
+    // Await the background subprocess so we know when it dies unexpectedly.
+    const result = await loginPromise;
+    dlog(attemptId, `setupLogin resolved: ok=${result && result.ok} alreadyInFlight=${result && result.alreadyInFlight} err=${result && result.error}`);
+
+    if (result && result.alreadyInFlight) {
+      // Should not happen because of signInLock, but log it defensively.
+      dlog(attemptId, 'defensive: another sign-in is running server-side, closing this UI');
+      hideSetup();
       return;
     }
 
-    // Poll auth status for up to 30s. The CLI processes the code, updates
-    // its config, and `claude auth status --json` flips loggedIn -> true.
-    for (let i = 0; i < 15; i++) {
-      if (cancelled) return;
-      await new Promise((r) => setTimeout(r, 2000));
-      const auth = await refreshAuth({ silent: true });
-      if (auth.loggedIn) {
+    if (cancelled) { dlog(attemptId, 'flow cancelled after loginPromise resolved'); return; }
+
+    const finalAuth = await refreshAuth({ silent: true });
+    dlog(attemptId, `final auth check after subprocess exit: loggedIn=${finalAuth.loggedIn} step=${currentStep}`);
+
+    if (finalAuth.loggedIn) {
+      // handleCodeSubmit already showed Connected! and scheduled hideSetup.
+      // Only show it here if we haven't already (edge case: subprocess ended
+      // before poll saw success).
+      if (currentStep !== 'connected') {
         showSetup({ title: 'Connected!', sub: 'All set.', spinner: false });
         setTimeout(() => hideSetup(), 900);
-        return;
       }
+      return;
     }
 
-    // Didn't verify — the code was probably wrong or the CLI is still waiting.
-    // Fall back to the paste field so the user can try again without a fresh
-    // OAuth round-trip (the subprocess is still alive and still on the same URL).
-    showPasteStep({
-      error: 'That code didn\'t verify. It may be expired or mistyped. Copy it again and try once more.',
+    // Subprocess exited without success and we're not authed. Show real error.
+    dlog(attemptId, 'showing failure screen');
+    showSetup({
+      title: 'Sign-in didn\'t finish',
+      sub: 'The sign-in helper ended before Forge could confirm your login.',
+      error: (result && result.error) || 'Unknown error.',
+      details: result && result.details,
+      actions: [
+        { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
+        { label: 'Try again', primary: true, onClick: promptSignIn },
+        { label: 'Close', onClick: () => hideSetup() },
+      ],
     });
-  };
-
-  // First render immediately — user can start pasting as soon as their browser shows the code.
-  showPasteStep();
-
-  // If the subprocess dies for any reason and we haven't succeeded, surface that
-  // (bad exit + still not authed = tell the user, don't spin forever).
-  const result = await loginPromise;
-  if (cancelled) return;
-  const finalAuth = await refreshAuth({ silent: true });
-  if (finalAuth.loggedIn) {
-    // Already showing "Connected!" from the poll — nothing to do.
-    return;
+  } finally {
+    dlog(attemptId, 'promptSignIn EXIT (releasing lock)');
+    signInLock = false;
   }
-  // Subprocess exited but we're still not signed in. Show a real error.
-  showSetup({
-    title: 'Sign-in didn\'t finish',
-    sub: 'The sign-in helper ended before Forge could confirm your login.',
-    error: result?.error || 'Unknown error.',
-    details: result?.details,
-    actions: [
-      { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
-      { label: 'Try again', primary: true, onClick: promptSignIn },
-      { label: 'Close', onClick: () => hideSetup() },
-    ],
-  });
 }
 
 /* ---------- Setup flow ---------- */
+let setupLock = false;
 function showSetup({ title, sub, spinner = false, error = null, details = null, actions = [], codeInput = null }) {
   $('setup-overlay').hidden = false;
   $('setup-title').textContent = title || '';
@@ -786,6 +855,19 @@ function hideSetup() {
 }
 
 async function runSetup() {
+  if (setupLock) {
+    dlog('lock', 'runSetup suppressed — already running');
+    return;
+  }
+  setupLock = true;
+  try {
+    return await runSetupInner();
+  } finally {
+    setupLock = false;
+  }
+}
+
+async function runSetupInner() {
   showSetup({ title: 'Getting Forge ready…', sub: 'Just a moment.', spinner: true });
   let status;
   try {
@@ -878,12 +960,20 @@ renderAuth();
 startAuthPolling();
 runSetup();
 
-$('auth-signin').addEventListener('click', async () => {
-  // Button label depends on state: no CLI → run full setup; otherwise pure sign-in.
-  if (state.auth.reason === 'no_bin') {
-    await runSetup();
-  } else {
-    await promptSignIn();
+$('auth-signin').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  if (btn.disabled) { dlog('lock', 'auth-signin click ignored — button disabled'); return; }
+  btn.disabled = true;
+  dlog('click', `auth-signin clicked; authReason=${state.auth.reason}`);
+  try {
+    // Button label depends on state: no CLI → run full setup; otherwise pure sign-in.
+    if (state.auth.reason === 'no_bin') {
+      await runSetup();
+    } else {
+      await promptSignIn();
+    }
+  } finally {
+    btn.disabled = false;
   }
 });
 
