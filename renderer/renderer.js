@@ -521,14 +521,33 @@ $('clear-selection').addEventListener('click', () => {
 });
 
 /* ---------- Setup flow ---------- */
-function showSetup({ title, sub, spinner = false, error = null, actions = [] }) {
+function showSetup({ title, sub, spinner = false, error = null, details = null, actions = [] }) {
   $('setup-overlay').hidden = false;
   $('setup-title').textContent = title || '';
   $('setup-sub').textContent = sub || '';
   $('setup-spinner').hidden = !spinner;
   const errEl = $('setup-error');
-  if (error) { errEl.textContent = error; errEl.hidden = false; }
-  else { errEl.textContent = ''; errEl.hidden = true; }
+  if (error) {
+    errEl.innerHTML = '';
+    const msg = document.createElement('div');
+    msg.textContent = error;
+    errEl.appendChild(msg);
+    if (details) {
+      const disc = document.createElement('details');
+      disc.className = 'setup-details';
+      const sum = document.createElement('summary');
+      sum.textContent = 'View technical details';
+      const pre = document.createElement('pre');
+      pre.textContent = details;
+      disc.appendChild(sum);
+      disc.appendChild(pre);
+      errEl.appendChild(disc);
+    }
+    errEl.hidden = false;
+  } else {
+    errEl.textContent = '';
+    errEl.hidden = true;
+  }
   const actionsEl = $('setup-actions');
   actionsEl.innerHTML = '';
   for (const a of actions) {
@@ -585,12 +604,29 @@ async function runSetup() {
     });
     const install = await window.forge.setupInstall();
     if (!install.ok) {
-      showSetup({
-        title: 'Setup couldn\'t finish',
-        sub: 'Forge tried to install its AI helper but hit a snag.',
-        error: install.error,
-        actions: [{ label: 'Try again', primary: true, onClick: runSetup }],
-      });
+      if (install.errorKind === 'needs_admin') {
+        showSetup({
+          title: 'Windows needs to grant permission',
+          sub: 'Forge needs administrator access for this one-time setup step.',
+          error: install.error,
+          details: install.details,
+          actions: [
+            { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
+            { label: 'I\'ve reopened as administrator — try again', primary: true, onClick: runSetup },
+          ],
+        });
+      } else {
+        showSetup({
+          title: 'Setup couldn\'t finish',
+          sub: 'Forge tried to install its AI helper but hit a snag.',
+          error: install.error,
+          details: install.details,
+          actions: [
+            { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
+            { label: 'Try again', primary: true, onClick: runSetup },
+          ],
+        });
+      }
       return;
     }
   }

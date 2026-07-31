@@ -501,8 +501,34 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   font-size: 13px;
   margin-top: 16px;
   text-align: left;
-  max-width: 400px;
+  max-width: 440px;
   line-height: 1.5;
+}
+.setup-details {
+  margin-top: 10px;
+  color: #d69b9b;
+  font-size: 12px;
+}
+.setup-details summary {
+  cursor: pointer;
+  color: #ffbcbc;
+  user-select: none;
+}
+.setup-details summary:hover { color: #ffd6d6; }
+.setup-details pre {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  background: #200f0f;
+  border: 1px solid #4a1e1e;
+  border-radius: 6px;
+  color: #f0c8c8;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .setup-actions {
   display: flex;

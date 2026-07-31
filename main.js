@@ -14,6 +14,28 @@ let setupChild = null;
 const CLAUDE_PKG = '@anthropic-ai/claude-code';
 const IS_WIN = process.platform === 'win32';
 
+function getLogPath() {
+  return path.join(app.getPath('userData'), 'setup.log');
+}
+
+function appendLog(text) {
+  try {
+    const p = getLogPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.appendFileSync(p, text);
+  } catch {}
+}
+
+function logHeader(title) {
+  const ts = new Date().toISOString();
+  appendLog(`\n===== ${ts} — ${title} =====\nplatform=${process.platform} arch=${process.arch} node=${process.versions.node} electron=${process.versions.electron}\n`);
+}
+
+function looksLikeAdminError(stderr) {
+  const s = (stderr || '').toLowerCase();
+  return /eperm|eacces|access is denied|permission denied|operation not permitted|elevation.*required|requires elevation/i.test(s);
+}
+
 function resolveNpmPath() {
   const candidates = IS_WIN
     ? [
@@ -252,6 +274,8 @@ ipcMain.handle('setup:status', async () => {
 
 ipcMain.handle('setup:install', async () => {
   return new Promise((resolve) => {
+    logHeader(`npm install -g ${CLAUDE_PKG}`);
+    appendLog(`npm bin: ${NPM_BIN}\n`);
     let child;
     const opts = {
       env: process.env,
@@ -262,37 +286,78 @@ ipcMain.handle('setup:install', async () => {
       const quoted = IS_WIN && opts.shell && NPM_BIN.includes(' ') ? `"${NPM_BIN}"` : NPM_BIN;
       child = spawn(quoted, ['install', '-g', CLAUDE_PKG], opts);
     } catch (err) {
-      resolve({ ok: false, error: friendlyInstallError(err.message) });
+      appendLog(`spawn threw: ${err.message}\n`);
+      resolve({
+        ok: false,
+        error: friendlyInstallError(err.message),
+        details: err.message,
+        logPath: getLogPath(),
+      });
       return;
     }
     setupChild = child;
+    let stdout = '';
     let stderr = '';
-    child.stdout.on('data', () => {
+    child.stdout.on('data', (d) => {
+      const s = d.toString('utf8');
+      stdout += s;
+      appendLog(s);
       sendToRenderer('setup:progress', { phase: 'installing' });
     });
     child.stderr.on('data', (d) => {
-      stderr += d.toString('utf8');
+      const s = d.toString('utf8');
+      stderr += s;
+      appendLog(s);
       sendToRenderer('setup:progress', { phase: 'installing' });
     });
     child.on('error', (err) => {
       setupChild = null;
-      resolve({ ok: false, error: friendlyInstallError(err.message) });
+      appendLog(`\nchild error: ${err.message}\n`);
+      resolve({
+        ok: false,
+        error: friendlyInstallError(err.message),
+        details: err.message,
+        logPath: getLogPath(),
+      });
     });
     child.on('close', async (code) => {
       setupChild = null;
+      appendLog(`\nexit code: ${code}\n`);
       if (code !== 0) {
-        resolve({ ok: false, error: friendlyInstallError(stderr, code) });
+        const combined = (stderr + '\n' + stdout).trim();
+        const needsAdmin = IS_WIN && looksLikeAdminError(combined);
+        if (needsAdmin) {
+          resolve({
+            ok: false,
+            errorKind: 'needs_admin',
+            error: 'Windows blocked the installer because Forge does not have administrator access. Close Forge, right-click its icon, choose "Run as administrator", and then run the setup again. You only need to do this once.',
+            details: combined.slice(-3000),
+            logPath: getLogPath(),
+          });
+          return;
+        }
+        resolve({
+          ok: false,
+          errorKind: 'generic',
+          error: friendlyInstallError(stderr, code),
+          details: combined.slice(-3000),
+          logPath: getLogPath(),
+        });
         return;
       }
       const found = await findClaudeAfterInstall();
       if (!found.ok) {
+        appendLog(`\npost-install lookup failed: ${found.error}\n`);
         resolve({
           ok: false,
           error: 'Installed successfully, but Forge could not find the new tools. Restarting your computer usually fixes this.',
+          details: found.error,
+          logPath: getLogPath(),
         });
         return;
       }
       CLAUDE_BIN = found.bin;
+      appendLog(`\nresolved claude bin: ${found.bin} (version ${found.version})\n`);
       resolve({ ok: true, version: found.version, bin: found.bin });
     });
   });
@@ -472,6 +537,20 @@ ipcMain.handle('setup:cancel', () => {
     return { ok: true };
   }
   return { ok: false };
+});
+
+ipcMain.handle('setup:revealLog', async () => {
+  const p = getLogPath();
+  try {
+    if (!fs.existsSync(p)) {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, '(setup has not written a log entry yet)\n');
+    }
+    shell.showItemInFolder(p);
+    return { ok: true, path: p };
+  } catch (e) {
+    return { ok: false, error: e.message, path: p };
+  }
 });
 
 ipcMain.handle('shell:openExternal', async (_e, url) => {

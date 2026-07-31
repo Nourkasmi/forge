@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('forge', {
   setupInstall: () => ipcRenderer.invoke('setup:install'),
   setupLogin: () => ipcRenderer.invoke('setup:login'),
   setupCancel: () => ipcRenderer.invoke('setup:cancel'),
+  setupRevealLog: () => ipcRenderer.invoke('setup:revealLog'),
   onSetupProgress: (cb) => ipcRenderer.on('setup:progress', (_e, data) => cb(data)),
   startClaude: (cwd, prompt, resumeSessionId) => ipcRenderer.invoke('claude:start', { cwd, prompt, resumeSessionId }),
   stopClaude: (sessionId) => ipcRenderer.invoke('claude:stop', { sessionId }),
