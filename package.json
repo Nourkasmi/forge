@@ -6,10 +6,10 @@
   "scripts": {
     "start": "electron .",
     "pack": "electron-builder --dir",
-    "build": "electron-builder",
-    "build:win": "electron-builder --win nsis portable",
-    "build:linux": "electron-builder --linux AppImage",
-    "build:mac": "electron-builder --mac dmg"
+    "build": "electron-builder --publish never",
+    "build:win": "electron-builder --win nsis portable --publish never",
+    "build:linux": "electron-builder --linux AppImage --publish never",
+    "build:mac": "electron-builder --mac dmg --publish never"
   },
   "author": "",
   "license": "MIT",
