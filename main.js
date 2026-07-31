@@ -382,21 +382,52 @@ ipcMain.handle('setup:login', async () => {
     try { setupChild.kill('SIGKILL'); } catch {}
     setupChild = null;
   }
+  logHeader('sign-in flow');
+  appendLog(`claude bin: ${CLAUDE_BIN}\n`);
+
+  const already = await isAuthenticated();
+  appendLog(`pre-check isAuthenticated: ${already}\n`);
+  if (already) return { ok: true };
 
   const first = await runLoginCommand();
-  if (first.ok) return { ok: true };
+  appendLog(`\n--- runLoginCommand summary ---\nok=${first.ok} exitCode=${first.code ?? '?'} tookMs=${first.tookMs ?? '?'}\n`);
+
+  const firstAuthed = await isAuthenticated();
+  appendLog(`post-first isAuthenticated: ${firstAuthed}\n`);
+  if (firstAuthed) return { ok: true };
 
   const interactive = await runInteractiveLogin();
-  if (interactive.ok) return { ok: true };
+  appendLog(`\n--- runInteractiveLogin summary ---\nok=${interactive.ok} exitCode=${interactive.code ?? '?'} killedForAuth=${interactive.killedForAuth ?? false}\n`);
+
+  const finalAuthed = await isAuthenticated();
+  appendLog(`post-interactive isAuthenticated: ${finalAuthed}\n`);
+  if (finalAuthed) return { ok: true };
+
+  const details = [
+    '--- Attempt 1: "claude login" ---',
+    `argv: ${CLAUDE_BIN} login`,
+    `exit code: ${first.code ?? '(no exit)'}`,
+    `stdout:\n${(first.stdout || '(empty)').trim()}`,
+    `stderr:\n${(first.stderr || '(empty)').trim()}`,
+    '',
+    '--- Attempt 2: interactive claude ---',
+    `argv: ${CLAUDE_BIN}`,
+    `exit code: ${interactive.code ?? '(killed)'}`,
+    `output:\n${(interactive.combined || '(empty)').trim()}`,
+  ].join('\n').slice(-4000);
 
   return {
     ok: false,
-    error: first.error || interactive.error || 'Sign-in did not complete. Please try again.',
+    error: 'Sign-in did not complete. Please try again, or open the setup log for details.',
+    details,
+    logPath: getLogPath(),
   };
 });
 
 function runLoginCommand() {
   return new Promise((resolve) => {
+    appendLog(`\n>>> spawn: ${CLAUDE_BIN} login\n`);
+    const startedAt = Date.now();
     let child;
     const opts = {
       env: process.env,
@@ -407,61 +438,69 @@ function runLoginCommand() {
       const quoted = IS_WIN && opts.shell && CLAUDE_BIN.includes(' ') ? `"${CLAUDE_BIN}"` : CLAUDE_BIN;
       child = spawn(quoted, ['login'], opts);
     } catch (err) {
-      resolve({ ok: false, error: err.message, tried: 'login' });
+      appendLog(`spawn threw: ${err.message}\n`);
+      resolve({ ok: false, code: -1, stdout: '', stderr: err.message, tookMs: Date.now() - startedAt });
       return;
     }
     setupChild = child;
-    let out = '';
-    let err = '';
+    let stdout = '';
+    let stderr = '';
     let urlOpened = false;
 
     const scan = (chunk) => {
-      out += chunk;
       if (urlOpened) return;
-      const m = out.match(/https?:\/\/[^\s\r\n"'`]+/);
+      const m = (stdout + stderr).match(/https?:\/\/[^\s\r\n"'`]+/);
       if (m) {
         urlOpened = true;
+        appendLog(`[detected url] ${m[0]}\n`);
         shell.openExternal(m[0]).catch(() => {});
         sendToRenderer('setup:progress', { phase: 'loggingIn', urlOpened: true });
       }
     };
-    child.stdout.on('data', (d) => scan(d.toString('utf8')));
+    child.stdout.on('data', (d) => {
+      const s = d.toString('utf8');
+      stdout += s;
+      appendLog(`[stdout] ${s}`);
+      scan();
+    });
     child.stderr.on('data', (d) => {
       const s = d.toString('utf8');
-      err += s;
-      scan(s);
+      stderr += s;
+      appendLog(`[stderr] ${s}`);
+      scan();
     });
 
+    const HARD_TIMEOUT_MS = 10 * 60 * 1000;
     const timeout = setTimeout(() => {
+      appendLog(`\n[timeout after ${HARD_TIMEOUT_MS}ms] killing child\n`);
       try { child.kill('SIGKILL'); } catch {}
-    }, 10 * 60 * 1000);
+    }, HARD_TIMEOUT_MS);
 
-    child.on('error', () => {
+    child.on('error', (e) => {
       clearTimeout(timeout);
       setupChild = null;
-      resolve({ ok: false, error: 'Sign-in command could not be started.', tried: 'login' });
+      appendLog(`[child error] ${e.message}\n`);
+      resolve({ ok: false, code: -1, stdout, stderr: stderr + '\n' + e.message, tookMs: Date.now() - startedAt });
     });
-    child.on('close', async (code) => {
+    child.on('close', (code) => {
       clearTimeout(timeout);
       setupChild = null;
-      const unknownCmd = /unknown command|invalid.*command|is not a valid|no such (?:sub)?command|is unknown/i.test(err);
-      if (unknownCmd) {
-        resolve({ ok: false, error: 'unknown_command', tried: 'login' });
-        return;
-      }
-      if (code === 0) {
-        const check = await isAuthenticated();
-        resolve({ ok: check, error: check ? null : 'Sign-in finished but Forge could not verify it.', tried: 'login' });
-        return;
-      }
-      resolve({ ok: false, error: friendlyLoginError(err, code), tried: 'login' });
+      appendLog(`[exit] code=${code}\n`);
+      resolve({ ok: code === 0, code, stdout, stderr, tookMs: Date.now() - startedAt });
     });
   });
 }
 
 function runInteractiveLogin() {
   return new Promise((resolve) => {
+    appendLog(`\n>>> spawn interactive: ${CLAUDE_BIN} (no args)\n`);
     let child;
+    let settled = false;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      resolve(payload);
+    };
     const opts = {
       env: { ...process.env, FORCE_COLOR: '0', TERM: 'dumb', NO_COLOR: '1' },
       shell: IS_WIN,
@@ -471,53 +510,72 @@ function runInteractiveLogin() {
       const quoted = IS_WIN && opts.shell && CLAUDE_BIN.includes(' ') ? `"${CLAUDE_BIN}"` : CLAUDE_BIN;
       child = spawn(quoted, [], opts);
     } catch (err) {
-      resolve({ ok: false, error: err.message });
+      appendLog(`spawn threw: ${err.message}\n`);
+      finish({ ok: false, code: -1, combined: err.message });
       return;
     }
     setupChild = child;
-    let out = '';
+    let combined = '';
     let urlOpened = false;
-    const scan = (chunk) => {
-      out += chunk;
-      if (!urlOpened) {
-        const m = out.match(/https?:\/\/[^\s\r\n"'`]+/);
-        if (m) {
-          urlOpened = true;
-          shell.openExternal(m[0]).catch(() => {});
-          sendToRenderer('setup:progress', { phase: 'loggingIn', urlOpened: true });
-        }
+    const scan = () => {
+      if (urlOpened) return;
+      const m = combined.match(/https?:\/\/[^\s\r\n"'`]+/);
+      if (m) {
+        urlOpened = true;
+        appendLog(`[detected url] ${m[0]}\n`);
+        shell.openExternal(m[0]).catch(() => {});
+        sendToRenderer('setup:progress', { phase: 'loggingIn', urlOpened: true });
       }
     };
-    child.stdout.on('data', (d) => scan(d.toString('utf8')));
-    child.stderr.on('data', (d) => scan(d.toString('utf8')));
+    child.stdout.on('data', (d) => {
+      const s = d.toString('utf8');
+      combined += s;
+      appendLog(`[stdout] ${s}`);
+      scan();
+    });
+    child.stderr.on('data', (d) => {
+      const s = d.toString('utf8');
+      combined += s;
+      appendLog(`[stderr] ${s}`);
+      scan();
+    });
 
     let doneChecks = 0;
+    const MAX_CHECKS = 60; // 5 min
     const checkInterval = setInterval(async () => {
+      if (settled) return;
       doneChecks++;
       const ok = await isAuthenticated();
+      appendLog(`[poll ${doneChecks}] isAuthenticated=${ok}\n`);
       if (ok) {
         clearInterval(checkInterval);
-        try { child.kill('SIGTERM'); } catch {}
+        try { child.kill(IS_WIN ? 'SIGKILL' : 'SIGTERM'); } catch {}
         setupChild = null;
-        resolve({ ok: true });
-      } else if (doneChecks > 60) {
+        finish({ ok: true, code: null, combined, killedForAuth: true });
+      } else if (doneChecks >= MAX_CHECKS) {
         clearInterval(checkInterval);
+        appendLog(`[timeout after ${MAX_CHECKS * 5}s]\n`);
         try { child.kill('SIGKILL'); } catch {}
         setupChild = null;
-        resolve({ ok: false, error: 'Sign-in timed out. Please try again.' });
+        finish({ ok: false, code: null, combined });
       }
     }, 5000);
 
-    child.on('error', () => {
+    child.on('error', (e) => {
       clearInterval(checkInterval);
       setupChild = null;
-      resolve({ ok: false, error: 'Could not start the sign-in helper.' });
+      appendLog(`[child error] ${e.message}\n`);
+      finish({ ok: false, code: -1, combined: combined + '\n' + e.message });
     });
-    child.on('close', async () => {
+    child.on('close', async (code) => {
       clearInterval(checkInterval);
       setupChild = null;
+      appendLog(`[exit] code=${code} (after ${doneChecks} auth polls)\n`);
+      if (settled) return;
+      // Give one last check in case OAuth completed as we exited
       const ok = await isAuthenticated();
-      resolve({ ok, error: ok ? null : 'Sign-in ended before finishing. Please try again.' });
+      appendLog(`[final check] isAuthenticated=${ok}\n`);
+      finish({ ok, code, combined });
     });
   });
 }

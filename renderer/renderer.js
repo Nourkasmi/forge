@@ -650,7 +650,11 @@ async function runSetup() {
       title: 'Sign-in didn\'t finish',
       sub: 'The sign-in step didn\'t complete.',
       error: login.error,
-      actions: [{ label: 'Try again', primary: true, onClick: runSetup }],
+      details: login.details,
+      actions: [
+        { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
+        { label: 'Try again', primary: true, onClick: runSetup },
+      ],
     });
     return;
   }
