@@ -18,9 +18,21 @@ function getLogPath() {
   return path.join(app.getPath('userData'), 'setup.log');
 }
 
+function getChatLogPath() {
+  return path.join(app.getPath('userData'), 'chat.log');
+}
+
 function appendLog(text) {
   try {
     const p = getLogPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.appendFileSync(p, text);
+  } catch {}
+}
+
+function appendChatLog(text) {
+  try {
+    const p = getChatLogPath();
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.appendFileSync(p, text);
   } catch {}
@@ -64,13 +76,14 @@ function resolveClaudePath() {
     const lines = execSync(cmd, opts).trim().split(/\r?\n/).filter(Boolean);
     if (IS_WIN) {
       // `where` returns every match (e.g. \claude, \claude.cmd, \claude.ps1).
-      // Node's spawn cannot execute the extension-less POSIX shim on Windows,
-      // so prefer a real Windows-executable variant.
+      // Windows spawn cannot execute the extension-less POSIX shim OR .ps1
+      // from cmd.exe /c; only .cmd, .bat, and .exe are safe.
       const cmdVar = lines.find((p) => /\.cmd$/i.test(p));
       if (cmdVar && fs.existsSync(cmdVar)) return cmdVar;
+      const batVar = lines.find((p) => /\.bat$/i.test(p));
+      if (batVar && fs.existsSync(batVar)) return batVar;
       const exeVar = lines.find((p) => /\.exe$/i.test(p));
       if (exeVar && fs.existsSync(exeVar)) return exeVar;
-      // Do NOT fall through to a bare-name shim; keep searching disk.
     } else if (lines[0] && fs.existsSync(lines[0])) {
       return lines[0];
     }
@@ -79,7 +92,6 @@ function resolveClaudePath() {
   const candidates = IS_WIN
     ? [
         path.join(process.env.APPDATA || '', 'npm', 'claude.cmd'),
-        path.join(process.env.APPDATA || '', 'npm', 'claude.ps1'),
         path.join(home, 'AppData', 'Roaming', 'npm', 'claude.cmd'),
         'C:\\Program Files\\nodejs\\claude.cmd',
       ]
@@ -95,46 +107,103 @@ function resolveClaudePath() {
   return 'claude';
 }
 
-function spawnClaude(args, opts = {}) {
+/**
+ * The single subprocess-spawning helper for all external tools (claude, npm, etc.).
+ *
+ * Windows quirks handled in one place:
+ *   - .cmd/.bat/.ps1 shims cannot be spawned directly since Node 18.20.2 / 20.12.2
+ *     (CVE-2024-27980). We route through cmd.exe /d /s /c.
+ *   - Node.spawn does NOT honor PATHEXT for bare names; cmd.exe does.
+ *   - `/d`  disables autorun scripts, which is the main cause of stdout pollution
+ *          (any AutoRun registry command would otherwise fire and print to stdout).
+ *   - `/s`  gives cmd.exe the "wrap entire remainder in quotes" parsing rule,
+ *          which lets our carefully-built cmdline pass through with its own
+ *          quoting intact.
+ *   - `/c`  run and exit — no interactive prompt after the child terminates.
+ *   - windowsVerbatimArguments: true — Node passes args to cmd.exe verbatim
+ *          (otherwise Node would double-escape our already-escaped cmdline).
+ *   - windowsHide: true — no console window flash.
+ *   - Arg escaping: each arg is doubled-quote-escaped and wrapped in "..." when it
+ *     contains any char cmd.exe would interpret. `%` is doubled to `%%` so cmd.exe's
+ *     variable expansion inside quotes leaves the literal `%` intact for the child.
+ */
+function spawnSafe(bin, args, opts = {}) {
   const options = { env: process.env, ...opts };
   if (IS_WIN) {
-    // On Windows, always route through cmd.exe /d /s /c so:
-    //   1. .cmd/.bat/.ps1 shims work (Node cannot spawn these directly since v18.20.2 / 20.12.2).
-    //   2. Bare-name resolution honors PATHEXT.
-    //   3. Extension-less POSIX shims that would ENOENT are bypassed.
-    const escape = (a) => (/[\s"^&|<>()%]/.test(a) ? '"' + String(a).replace(/"/g, '""') + '"' : String(a));
-    const binQuoted = /\s/.test(CLAUDE_BIN) ? `"${CLAUDE_BIN}"` : CLAUDE_BIN;
-    const line = [binQuoted, ...args.map(escape)].join(' ');
+    const escapeArg = (a) => {
+      const s = String(a).replace(/%/g, '%%');
+      if (s === '' || /[\s"^&|<>()!%]/.test(s)) {
+        return '"' + s.replace(/"/g, '""') + '"';
+      }
+      return s;
+    };
+    const binQuoted = /\s/.test(bin)
+      ? '"' + String(bin).replace(/"/g, '""') + '"'
+      : bin;
+    const line = [binQuoted, ...args.map(escapeArg)].join(' ');
     return spawn('cmd.exe', ['/d', '/s', '/c', line], {
       ...options,
       windowsVerbatimArguments: true,
+      windowsHide: true,
     });
   }
-  return spawn(CLAUDE_BIN, args, options);
+  return spawn(bin, args, options);
+}
+
+function spawnClaude(args, opts) {
+  return spawnSafe(CLAUDE_BIN, args, opts);
+}
+
+function spawnNpm(args, opts) {
+  return spawnSafe(NPM_BIN, args, opts);
+}
+
+/**
+ * Kill a child process AND its descendants. On Windows, child.kill() only kills
+ * the immediate child (cmd.exe in our wrapping); it does NOT cascade to the
+ * grandchild (node.exe / npm / claude). Without taskkill /T, killing cmd.exe
+ * leaves the actual work process orphaned.
+ */
+function killChildTree(child) {
+  if (!child) return;
+  const pid = child.pid;
+  if (IS_WIN && pid) {
+    try {
+      const killer = spawn('taskkill', ['/F', '/T', '/PID', String(pid)], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.on('error', () => {});
+    } catch {}
+  }
+  try { child.kill('SIGKILL'); } catch {}
 }
 
 function spawnCollect(cmd, args, options = {}) {
   return new Promise((resolve) => {
-    const opts = { env: process.env, shell: IS_WIN, ...options };
     let stdout = '';
     let stderr = '';
     let child;
     try {
-      const quoted = IS_WIN && opts.shell && cmd.includes(' ') ? `"${cmd}"` : cmd;
-      child = spawn(quoted, args, opts);
+      child = spawnSafe(cmd, args, options);
     } catch (err) {
       resolve({ ok: false, code: -1, error: err.message, stdout, stderr });
       return;
     }
+    let timer;
     if (options.timeoutMs) {
-      setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch {}
-      }, options.timeoutMs);
+      timer = setTimeout(() => killChildTree(child), options.timeoutMs);
     }
     child.stdout?.on('data', (d) => { stdout += d.toString('utf8'); });
     child.stderr?.on('data', (d) => { stderr += d.toString('utf8'); });
-    child.on('error', (err) => resolve({ ok: false, code: -1, error: err.message, stdout, stderr }));
-    child.on('close', (code) => resolve({ ok: code === 0, code, stdout, stderr }));
+    child.on('error', (err) => {
+      if (timer) clearTimeout(timer);
+      resolve({ ok: false, code: -1, error: err.message, stdout, stderr });
+    });
+    child.on('close', (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ ok: code === 0, code, stdout, stderr });
+    });
   });
 }
 
@@ -226,9 +295,7 @@ async function isAuthenticated() {
     let sawResult = false;
     let sawAuthError = false;
     const buffer = { s: '' };
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch {}
-    }, 15000);
+    const timer = setTimeout(() => killChildTree(child), 15000);
     child.stdout.on('data', (d) => {
       buffer.s += d.toString('utf8');
       let nl;
@@ -285,12 +352,10 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-  for (const child of sessions.values()) {
-    try { child.kill('SIGKILL'); } catch {}
-  }
+  for (const child of sessions.values()) killChildTree(child);
   sessions.clear();
   if (setupChild) {
-    try { setupChild.kill('SIGKILL'); } catch {}
+    killChildTree(setupChild);
     setupChild = null;
   }
   if (process.platform !== 'darwin') app.quit();
@@ -321,14 +386,10 @@ ipcMain.handle('setup:install', async () => {
     logHeader(`npm install -g ${CLAUDE_PKG}`);
     appendLog(`npm bin: ${NPM_BIN}\n`);
     let child;
-    const opts = {
-      env: process.env,
-      shell: IS_WIN,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    };
     try {
-      const quoted = IS_WIN && opts.shell && NPM_BIN.includes(' ') ? `"${NPM_BIN}"` : NPM_BIN;
-      child = spawn(quoted, ['install', '-g', CLAUDE_PKG], opts);
+      child = spawnNpm(['install', '-g', CLAUDE_PKG], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
     } catch (err) {
       appendLog(`spawn threw: ${err.message}\n`);
       resolve({
@@ -423,7 +484,7 @@ function friendlyInstallError(raw, code) {
 
 ipcMain.handle('setup:login', async () => {
   if (setupChild) {
-    try { setupChild.kill('SIGKILL'); } catch {}
+    killChildTree(setupChild);
     setupChild = null;
   }
   logHeader('sign-in flow');
@@ -473,14 +534,8 @@ function runLoginCommand() {
     appendLog(`\n>>> spawn: ${CLAUDE_BIN} login\n`);
     const startedAt = Date.now();
     let child;
-    const opts = {
-      env: process.env,
-      shell: IS_WIN,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    };
     try {
-      const quoted = IS_WIN && opts.shell && CLAUDE_BIN.includes(' ') ? `"${CLAUDE_BIN}"` : CLAUDE_BIN;
-      child = spawn(quoted, ['login'], opts);
+      child = spawnClaude(['login'], { stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (err) {
       appendLog(`spawn threw: ${err.message}\n`);
       resolve({ ok: false, code: -1, stdout: '', stderr: err.message, tookMs: Date.now() - startedAt });
@@ -517,7 +572,7 @@ function runLoginCommand() {
     const HARD_TIMEOUT_MS = 10 * 60 * 1000;
     const timeout = setTimeout(() => {
       appendLog(`\n[timeout after ${HARD_TIMEOUT_MS}ms] killing child\n`);
-      try { child.kill('SIGKILL'); } catch {}
+      killChildTree(child);
     }, HARD_TIMEOUT_MS);
 
     child.on('error', (e) => {
@@ -545,14 +600,11 @@ function runInteractiveLogin() {
       settled = true;
       resolve(payload);
     };
-    const opts = {
-      env: { ...process.env, FORCE_COLOR: '0', TERM: 'dumb', NO_COLOR: '1' },
-      shell: IS_WIN,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    };
     try {
-      const quoted = IS_WIN && opts.shell && CLAUDE_BIN.includes(' ') ? `"${CLAUDE_BIN}"` : CLAUDE_BIN;
-      child = spawn(quoted, [], opts);
+      child = spawnClaude([], {
+        env: { ...process.env, FORCE_COLOR: '0', TERM: 'dumb', NO_COLOR: '1' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
     } catch (err) {
       appendLog(`spawn threw: ${err.message}\n`);
       finish({ ok: false, code: -1, combined: err.message });
@@ -593,13 +645,13 @@ function runInteractiveLogin() {
       appendLog(`[poll ${doneChecks}] isAuthenticated=${ok}\n`);
       if (ok) {
         clearInterval(checkInterval);
-        try { child.kill(IS_WIN ? 'SIGKILL' : 'SIGTERM'); } catch {}
+        killChildTree(child);
         setupChild = null;
         finish({ ok: true, code: null, combined, killedForAuth: true });
       } else if (doneChecks >= MAX_CHECKS) {
         clearInterval(checkInterval);
         appendLog(`[timeout after ${MAX_CHECKS * 5}s]\n`);
-        try { child.kill('SIGKILL'); } catch {}
+        killChildTree(child);
         setupChild = null;
         finish({ ok: false, code: null, combined });
       }
@@ -634,7 +686,7 @@ function friendlyLoginError(stderr, code) {
 
 ipcMain.handle('setup:cancel', () => {
   if (setupChild) {
-    try { setupChild.kill('SIGKILL'); } catch {}
+    killChildTree(setupChild);
     setupChild = null;
     return { ok: true };
   }
@@ -647,6 +699,20 @@ ipcMain.handle('setup:revealLog', async () => {
     if (!fs.existsSync(p)) {
       fs.mkdirSync(path.dirname(p), { recursive: true });
       fs.writeFileSync(p, '(setup has not written a log entry yet)\n');
+    }
+    shell.showItemInFolder(p);
+    return { ok: true, path: p };
+  } catch (e) {
+    return { ok: false, error: e.message, path: p };
+  }
+});
+
+ipcMain.handle('chat:revealLog', async () => {
+  const p = getChatLogPath();
+  try {
+    if (!fs.existsSync(p)) {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, '(no chat activity yet)\n');
     }
     shell.showItemInFolder(p);
     return { ok: true, path: p };
@@ -757,6 +823,41 @@ ipcMain.handle('claude:start', async (_e, { cwd, prompt, resumeSessionId }) => {
   }
   sessions.set(sessionId, child);
 
+  const started = Date.now();
+  appendChatLog(`\n===== ${new Date().toISOString()} — session ${sessionId} =====\ncwd=${cwd} bin=${CLAUDE_BIN} resume=${resumeSessionId || '(none)'}\n`);
+
+  let eventCount = 0;
+  let skipCount = 0;
+
+  const tryEmit = (rawLine) => {
+    // Tolerate CRLF from Windows subprocesses; strip surrounding whitespace.
+    const line = rawLine.replace(/^﻿/, '').replace(/\r$/, '').trim();
+    if (!line) return;
+    // Fast-path: a stream-json line always starts with '{'. Anything else is
+    // almost certainly stray output from cmd.exe / shim / stderr-on-stdout —
+    // log it for debugging but don't crash the response or the UI.
+    if (line[0] !== '{') {
+      skipCount++;
+      appendChatLog(`[skip:non-json] ${line.slice(0, 400)}\n`);
+      return;
+    }
+    let evt;
+    try {
+      evt = JSON.parse(line);
+    } catch (err) {
+      skipCount++;
+      appendChatLog(`[skip:parse-error] ${err.message} :: ${line.slice(0, 400)}\n`);
+      return;
+    }
+    if (!evt || typeof evt !== 'object') {
+      skipCount++;
+      appendChatLog(`[skip:not-object] ${line.slice(0, 400)}\n`);
+      return;
+    }
+    eventCount++;
+    sendToRenderer('claude:event', { sessionId, event: evt });
+  };
+
   let stdoutBuffer = '';
   child.stdout.on('data', (chunk) => {
     stdoutBuffer += chunk.toString('utf8');
@@ -764,37 +865,28 @@ ipcMain.handle('claude:start', async (_e, { cwd, prompt, resumeSessionId }) => {
     while ((nl = stdoutBuffer.indexOf('\n')) >= 0) {
       const line = stdoutBuffer.slice(0, nl);
       stdoutBuffer = stdoutBuffer.slice(nl + 1);
-      if (!line.trim()) continue;
-      try {
-        const evt = JSON.parse(line);
-        sendToRenderer('claude:event', { sessionId, event: evt });
-      } catch (err) {
-        sendToRenderer('claude:event', {
-          sessionId,
-          event: { type: 'parse_error', raw: line, error: err.message },
-        });
-      }
+      tryEmit(line);
     }
   });
 
   child.stderr.on('data', (chunk) => {
-    sendToRenderer('claude:stderr', { sessionId, text: chunk.toString('utf8') });
+    const s = chunk.toString('utf8');
+    appendChatLog(`[stderr] ${s}`);
+    sendToRenderer('claude:stderr', { sessionId, text: s });
   });
 
   child.on('error', (err) => {
+    appendChatLog(`[child error] ${err.message}\n`);
     sendToRenderer('claude:error', { sessionId, message: err.message });
   });
 
   child.on('close', (code, signal) => {
-    if (stdoutBuffer.trim()) {
-      try {
-        const evt = JSON.parse(stdoutBuffer);
-        sendToRenderer('claude:event', { sessionId, event: evt });
-      } catch {}
-      stdoutBuffer = '';
-    }
+    // Flush any trailing partial line.
+    if (stdoutBuffer.trim()) tryEmit(stdoutBuffer);
+    stdoutBuffer = '';
     sessions.delete(sessionId);
-    sendToRenderer('claude:closed', { sessionId, code, signal });
+    appendChatLog(`[exit] code=${code} signal=${signal} events=${eventCount} skipped=${skipCount} durationMs=${Date.now() - started}\n`);
+    sendToRenderer('claude:closed', { sessionId, code, signal, eventCount, skipCount });
   });
 
   return { ok: true, sessionId, bin: CLAUDE_BIN };
@@ -803,16 +895,6 @@ ipcMain.handle('claude:start', async (_e, { cwd, prompt, resumeSessionId }) => {
 ipcMain.handle('claude:stop', async (_e, { sessionId }) => {
   const child = sessions.get(sessionId);
   if (!child) return { ok: false, reason: 'not_found' };
-  try {
-    child.kill('SIGTERM');
-    setTimeout(() => {
-      const still = sessions.get(sessionId);
-      if (still) {
-        try { still.kill('SIGKILL'); } catch {}
-      }
-    }, 500);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, reason: err.message };
-  }
+  killChildTree(child);
+  return { ok: true };
 });

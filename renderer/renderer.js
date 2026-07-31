@@ -467,9 +467,6 @@ function handleEvent(evt) {
       // Final answer text is already delivered via the last assistant text block.
       // We only note completion here.
       break;
-    case 'parse_error':
-      addStep('⚠️', 'Received unparseable output', 'warn');
-      break;
     case 'rate_limit_event':
     default:
       break;
@@ -686,20 +683,39 @@ window.forge.onError(({ message }) => {
   addStep('❌', 'Error: ' + message, 'error');
 });
 
-window.forge.onClosed(({ code, signal }) => {
+window.forge.onClosed(({ code, signal, eventCount = 0, skipCount = 0 }) => {
   for (const [, info] of state.pendingTools) {
     if (info.fileName && info.verb === 'write') markFileDone(info.fileName);
   }
   state.pendingTools.clear();
   if (signal === 'SIGTERM' || signal === 'SIGKILL') {
     addStep('🛑', 'Stopped by you.', 'end');
-  } else if (code === 0) {
+  } else if (code === 0 && eventCount > 0) {
     addStep('✅', 'Done.', 'end');
+  } else if (code === 0 && eventCount === 0) {
+    addStep('⚠️', 'Finished without producing any output.', 'warn');
+    addLogHint();
   } else {
     addStep('⛔', 'Ended (exit code ' + code + ').', 'error');
+    if (skipCount > 0) {
+      addStep('ℹ️', `${skipCount} unreadable line${skipCount === 1 ? '' : 's'} were skipped — details in the chat log.`, 'warn');
+    }
+    addLogHint();
   }
   endTrail();
   setRunning(false);
   state.session = null;
   refreshGrid();
 });
+
+function addLogHint() {
+  if (!state.currentTrail) return;
+  const btn = document.createElement('button');
+  btn.className = 'setup-btn';
+  btn.style.marginTop = '8px';
+  btn.style.alignSelf = 'flex-start';
+  btn.textContent = 'Show chat log';
+  btn.addEventListener('click', () => window.forge.chatRevealLog());
+  state.currentTrail.appendChild(btn);
+  scrollBottom();
+}
