@@ -8,10 +8,31 @@ let mainWindow = null;
 const sessions = new Map();
 let nextSessionId = 1;
 let CLAUDE_BIN = null;
+let NPM_BIN = 'npm';
 let setupChild = null;
 
 const CLAUDE_PKG = '@anthropic-ai/claude-code';
 const IS_WIN = process.platform === 'win32';
+
+function resolveNpmPath() {
+  const candidates = IS_WIN
+    ? [
+        'C:\\Program Files\\nodejs\\npm.cmd',
+        'C:\\Program Files (x86)\\nodejs\\npm.cmd',
+        path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'npm.cmd'),
+        path.join(process.env.APPDATA || '', 'npm', 'npm.cmd'),
+      ]
+    : [
+        '/usr/local/bin/npm',
+        '/usr/bin/npm',
+        '/opt/homebrew/bin/npm',
+        path.join(process.env.HOME || '', '.nvm/versions/node/current/bin/npm'),
+      ];
+  for (const c of candidates) {
+    try { if (c && fs.existsSync(c)) return c; } catch {}
+  }
+  return 'npm';
+}
 
 function resolveClaudePath() {
   if (process.env.CLAUDE_BIN) return process.env.CLAUDE_BIN;
@@ -76,8 +97,19 @@ async function probeClaude(binPath) {
 }
 
 async function probeNpm() {
-  const res = await spawnCollect('npm', ['--version'], { timeoutMs: 5000 });
-  if (res.ok && /\d/.test(res.stdout)) return { ok: true, version: res.stdout.trim() };
+  let res = await spawnCollect('npm', ['--version'], { timeoutMs: 5000 });
+  if (res.ok && /\d/.test(res.stdout)) {
+    NPM_BIN = 'npm';
+    return { ok: true, version: res.stdout.trim(), bin: NPM_BIN };
+  }
+  const disk = resolveNpmPath();
+  if (disk !== 'npm') {
+    res = await spawnCollect(disk, ['--version'], { timeoutMs: 5000 });
+    if (res.ok && /\d/.test(res.stdout)) {
+      NPM_BIN = disk;
+      return { ok: true, version: res.stdout.trim(), bin: NPM_BIN };
+    }
+  }
   return { ok: false, error: res.stderr || res.error || `Exit ${res.code}` };
 }
 
@@ -85,7 +117,7 @@ async function findClaudeAfterInstall() {
   const direct = await probeClaude('claude');
   if (direct.ok) return direct;
 
-  const prefixRes = await spawnCollect('npm', ['config', 'get', 'prefix'], { timeoutMs: 5000 });
+  const prefixRes = await spawnCollect(NPM_BIN, ['config', 'get', 'prefix'], { timeoutMs: 5000 });
   const prefix = prefixRes.ok ? prefixRes.stdout.trim() : null;
   if (!prefix) return { ok: false, error: 'Could not locate npm install prefix.' };
 
@@ -221,12 +253,14 @@ ipcMain.handle('setup:status', async () => {
 ipcMain.handle('setup:install', async () => {
   return new Promise((resolve) => {
     let child;
+    const opts = {
+      env: process.env,
+      shell: IS_WIN,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    };
     try {
-      child = spawn('npm', ['install', '-g', CLAUDE_PKG], {
-        env: process.env,
-        shell: IS_WIN,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      const quoted = IS_WIN && opts.shell && NPM_BIN.includes(' ') ? `"${NPM_BIN}"` : NPM_BIN;
+      child = spawn(quoted, ['install', '-g', CLAUDE_PKG], opts);
     } catch (err) {
       resolve({ ok: false, error: friendlyInstallError(err.message) });
       return;
