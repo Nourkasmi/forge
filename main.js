@@ -130,7 +130,8 @@ function resolveClaudePath() {
  *     variable expansion inside quotes leaves the literal `%` intact for the child.
  */
 function spawnSafe(bin, args, opts = {}) {
-  const options = { env: process.env, ...opts };
+  const { logTo, ...spawnOpts } = opts;
+  const options = { env: process.env, ...spawnOpts };
   if (IS_WIN) {
     const escapeArg = (a) => {
       const s = String(a).replace(/%/g, '%%');
@@ -143,11 +144,19 @@ function spawnSafe(bin, args, opts = {}) {
       ? '"' + String(bin).replace(/"/g, '""') + '"'
       : bin;
     const line = [binQuoted, ...args.map(escapeArg)].join(' ');
+    if (typeof logTo === 'function') {
+      logTo(`[spawn win] cmd.exe /d /s /c <line>  (windowsVerbatimArguments)\n`);
+      logTo(`[spawn line] ${line}\n`);
+      logTo(`[spawn line-has-newline] ${line.includes('\n')} line-len=${line.length}\n`);
+    }
     return spawn('cmd.exe', ['/d', '/s', '/c', line], {
       ...options,
       windowsVerbatimArguments: true,
       windowsHide: true,
     });
+  }
+  if (typeof logTo === 'function') {
+    logTo(`[spawn unix] ${bin} ${args.map((a) => JSON.stringify(a)).join(' ')}\n`);
   }
   return spawn(bin, args, options);
 }
@@ -841,23 +850,51 @@ ipcMain.handle('claude:start', async (_e, { cwd, prompt, resumeSessionId }) => {
   }
 
   const sessionId = String(nextSessionId++);
+  // CRITICAL: the prompt goes via STDIN, not via -p's argv value.
+  //
+  // Passing prompt as -p <value> on Windows meant that Windows CreateProcess
+  // built a cmd.exe command line with literal \n characters embedded in the
+  // quoted arg (context prefix has newlines). cmd.exe then interpreted each
+  // \n as an end-of-command, silently truncating the arg and leaving the CLI
+  // to fall back to interactive-idle mode ("What would you like help with?").
+  //
+  // `-p --input-format text` tells the CLI to read the prompt from stdin.
+  // Stdin is a raw byte stream — no cmd.exe interpretation, no escaping,
+  // no length limits from CreateProcess (~32k). Works identically on all OSes.
   const args = [];
   if (resumeSessionId) args.push('--resume', resumeSessionId);
-  args.push('-p', prompt, '--output-format', 'stream-json', '--verbose');
+  args.push('-p', '--input-format', 'text', '--output-format', 'stream-json', '--verbose');
+
+  const started = Date.now();
+  appendChatLog(`\n===== ${new Date().toISOString()} — session ${sessionId} =====\ncwd=${cwd} bin=${CLAUDE_BIN} resume=${resumeSessionId || '(none)'}\n`);
+  appendChatLog(`[argv unescaped] (prompt is NOT in argv — it goes via stdin)\n`);
+  args.forEach((a, i) => appendChatLog(`  [${i}] ${JSON.stringify(a)}\n`));
+  appendChatLog(`[prompt via stdin] bytes=${Buffer.byteLength(prompt, 'utf8')} lines=${prompt.split('\n').length}\n`);
+  const preview = prompt.slice(0, 240).replace(/\n/g, '\\n');
+  appendChatLog(`[prompt preview] ${preview}${prompt.length > 240 ? '…' : ''}\n`);
+
   let child;
   try {
     child = spawnClaude(args, {
       cwd,
       env: process.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
+      logTo: appendChatLog,
     });
   } catch (err) {
+    appendChatLog(`[spawn error] ${err.message}\n`);
     return { ok: false, reason: 'spawn_failed', message: err.message };
   }
   sessions.set(sessionId, child);
 
-  const started = Date.now();
-  appendChatLog(`\n===== ${new Date().toISOString()} — session ${sessionId} =====\ncwd=${cwd} bin=${CLAUDE_BIN} resume=${resumeSessionId || '(none)'}\n`);
+  // Send the prompt over stdin and close it, so the CLI stops reading.
+  try {
+    child.stdin.write(prompt, 'utf8');
+    child.stdin.end();
+    appendChatLog(`[stdin] wrote ${Buffer.byteLength(prompt, 'utf8')} bytes and closed\n`);
+  } catch (err) {
+    appendChatLog(`[stdin write error] ${err.message}\n`);
+  }
 
   let eventCount = 0;
   let skipCount = 0;
