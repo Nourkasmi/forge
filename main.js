@@ -61,8 +61,19 @@ function resolveClaudePath() {
   try {
     const cmd = IS_WIN ? 'where claude' : 'command -v claude 2>/dev/null || which claude 2>/dev/null';
     const opts = IS_WIN ? { encoding: 'utf8' } : { shell: '/bin/bash', encoding: 'utf8' };
-    const found = execSync(cmd, opts).trim().split(/\r?\n/)[0];
-    if (found && fs.existsSync(found)) return found;
+    const lines = execSync(cmd, opts).trim().split(/\r?\n/).filter(Boolean);
+    if (IS_WIN) {
+      // `where` returns every match (e.g. \claude, \claude.cmd, \claude.ps1).
+      // Node's spawn cannot execute the extension-less POSIX shim on Windows,
+      // so prefer a real Windows-executable variant.
+      const cmdVar = lines.find((p) => /\.cmd$/i.test(p));
+      if (cmdVar && fs.existsSync(cmdVar)) return cmdVar;
+      const exeVar = lines.find((p) => /\.exe$/i.test(p));
+      if (exeVar && fs.existsSync(exeVar)) return exeVar;
+      // Do NOT fall through to a bare-name shim; keep searching disk.
+    } else if (lines[0] && fs.existsSync(lines[0])) {
+      return lines[0];
+    }
   } catch {}
   const home = process.env.HOME || process.env.USERPROFILE || '';
   const candidates = IS_WIN
@@ -82,6 +93,24 @@ function resolveClaudePath() {
     try { if (c && fs.existsSync(c)) return c; } catch {}
   }
   return 'claude';
+}
+
+function spawnClaude(args, opts = {}) {
+  const options = { env: process.env, ...opts };
+  if (IS_WIN) {
+    // On Windows, always route through cmd.exe /d /s /c so:
+    //   1. .cmd/.bat/.ps1 shims work (Node cannot spawn these directly since v18.20.2 / 20.12.2).
+    //   2. Bare-name resolution honors PATHEXT.
+    //   3. Extension-less POSIX shims that would ENOENT are bypassed.
+    const escape = (a) => (/[\s"^&|<>()%]/.test(a) ? '"' + String(a).replace(/"/g, '""') + '"' : String(a));
+    const binQuoted = /\s/.test(CLAUDE_BIN) ? `"${CLAUDE_BIN}"` : CLAUDE_BIN;
+    const line = [binQuoted, ...args.map(escape)].join(' ');
+    return spawn('cmd.exe', ['/d', '/s', '/c', line], {
+      ...options,
+      windowsVerbatimArguments: true,
+    });
+  }
+  return spawn(CLAUDE_BIN, args, options);
 }
 
 function spawnCollect(cmd, args, options = {}) {
@@ -136,45 +165,60 @@ async function probeNpm() {
 }
 
 async function findClaudeAfterInstall() {
-  const direct = await probeClaude('claude');
-  if (direct.ok) return direct;
-
+  // Ask npm exactly where it installed things. Never accept the bare name
+  // 'claude' as a resolved bin — Windows spawn needs the concrete .cmd path.
   const prefixRes = await spawnCollect(NPM_BIN, ['config', 'get', 'prefix'], { timeoutMs: 5000 });
   const prefix = prefixRes.ok ? prefixRes.stdout.trim() : null;
-  if (!prefix) return { ok: false, error: 'Could not locate npm install prefix.' };
 
+  const home = process.env.HOME || process.env.USERPROFILE || '';
   const candidates = IS_WIN
     ? [
-        path.join(prefix, 'claude.cmd'),
-        path.join(prefix, 'claude.ps1'),
-        path.join(prefix, 'claude'),
+        prefix && path.join(prefix, 'claude.cmd'),
+        prefix && path.join(prefix, 'claude.ps1'),
+        path.join(process.env.APPDATA || '', 'npm', 'claude.cmd'),
+        path.join(home, 'AppData', 'Roaming', 'npm', 'claude.cmd'),
+        'C:\\Program Files\\nodejs\\claude.cmd',
       ]
     : [
-        path.join(prefix, 'bin', 'claude'),
-        path.join(prefix, 'claude'),
+        prefix && path.join(prefix, 'bin', 'claude'),
+        prefix && path.join(prefix, 'claude'),
+        path.join(home, '.local/bin/claude'),
+        '/usr/local/bin/claude',
+        '/opt/homebrew/bin/claude',
       ];
+
+  appendLog(`findClaudeAfterInstall: npm prefix=${prefix}\n`);
   for (const c of candidates) {
-    if (fs.existsSync(c)) {
+    if (c && fs.existsSync(c)) {
+      appendLog(`  probing ${c}\n`);
       const probe = await probeClaude(c);
-      if (probe.ok) return probe;
+      if (probe.ok) {
+        appendLog(`  resolved: ${c} (version ${probe.version})\n`);
+        return probe;
+      }
     }
   }
+
+  // Last-ditch: fall back to bare 'claude' via shell resolution. This is
+  // only safe because every downstream spawn goes through spawnClaude, which
+  // routes through cmd.exe on Windows and can resolve PATHEXT itself.
+  const bare = await probeClaude('claude');
+  if (bare.ok) {
+    appendLog(`  resolved via shell PATH (bin=claude, no absolute path found)\n`);
+    return bare;
+  }
+
   return { ok: false, error: 'Installed, but the claude binary was not found on disk.' };
 }
 
 async function isAuthenticated() {
   const tmpCwd = os.tmpdir();
-  const bin = CLAUDE_BIN;
   return new Promise((resolve) => {
     let child;
-    const opts = {
-      cwd: tmpCwd,
-      env: process.env,
-      shell: IS_WIN,
-    };
     try {
-      const quoted = IS_WIN && opts.shell && bin.includes(' ') ? `"${bin}"` : bin;
-      child = spawn(quoted, ['-p', 'ok', '--output-format', 'stream-json', '--verbose'], opts);
+      child = spawnClaude(['-p', 'ok', '--output-format', 'stream-json', '--verbose'], {
+        cwd: tmpCwd,
+      });
     } catch {
       resolve(false);
       return;
@@ -703,7 +747,7 @@ ipcMain.handle('claude:start', async (_e, { cwd, prompt, resumeSessionId }) => {
   args.push('-p', prompt, '--output-format', 'stream-json', '--verbose');
   let child;
   try {
-    child = spawn(CLAUDE_BIN, args, {
+    child = spawnClaude(args, {
       cwd,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
