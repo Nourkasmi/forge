@@ -1,0 +1,14 @@
+{
+  "name": "forge",
+  "version": "0.1.0",
+  "description": "Visual GUI for AI coding agents — no terminal required.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^32.2.0"
+  }
+}

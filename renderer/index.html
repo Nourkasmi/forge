@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+    <title>Forge</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="setup-overlay">
+      <div class="setup-card">
+        <div class="setup-title" id="setup-title">Getting Forge ready…</div>
+        <div class="setup-sub" id="setup-sub">Just a moment.</div>
+        <div class="setup-spinner" id="setup-spinner"></div>
+        <div class="setup-error" id="setup-error" hidden></div>
+        <div class="setup-actions" id="setup-actions"></div>
+      </div>
+    </div>
+
+    <div id="app">
+      <aside id="explorer">
+        <div class="explorer-header" id="explorer-header" hidden>
+          <button id="choose-folder">Change folder</button>
+          <button id="up-folder" class="secondary" title="Go up">↑</button>
+          <div id="folder-path" class="folder-path"></div>
+        </div>
+
+        <div class="landing" id="landing">
+          <div class="landing-inner">
+            <div class="landing-title">Where should we work?</div>
+            <div class="landing-sub">
+              Pick a folder — Forge treats it as the workspace for this conversation.
+            </div>
+            <div class="landing-tiles" id="landing-tiles"></div>
+            <button class="landing-browse" id="landing-browse">
+              Browse for another folder…
+            </button>
+          </div>
+        </div>
+
+        <div id="grid" class="grid" hidden></div>
+      </aside>
+
+      <main id="chat">
+        <header class="chat-header">
+          <div class="brand"><span class="brand-mark">◆</span> Forge</div>
+          <div class="header-right">
+            <button id="new-chat" class="secondary" title="Start a fresh conversation">New chat</button>
+            <div class="status" id="status">Idle</div>
+          </div>
+        </header>
+
+        <div id="messages" class="messages">
+          <div class="msg msg-system">
+            Welcome. Pick a folder on the left, then tell Forge what you want done — build a site, rename files, explain the code, anything.
+          </div>
+        </div>
+
+        <div class="composer">
+          <div class="composer-left">
+            <div id="selection-pill" class="selection-pill" hidden>
+              <span class="pill-icon">📎</span>
+              <span id="selection-name" class="pill-name"></span>
+              <button id="clear-selection" class="pill-clear" title="Clear selection">×</button>
+            </div>
+            <textarea id="input" placeholder="What should Forge do in this folder?" rows="2"></textarea>
+          </div>
+          <div class="composer-actions">
+            <button id="send">Send</button>
+            <button id="stop" class="stop-btn" hidden>Stop</button>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
