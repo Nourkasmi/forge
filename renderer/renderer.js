@@ -601,39 +601,114 @@ function startAuthPolling() {
 }
 
 async function promptSignIn() {
-  // Reuse the setup overlay to run the same login flow.
-  showSetup({
-    title: 'Sign in to Anthropic',
-    sub: 'Your web browser should open in a moment. Sign in there, then come back to this window.',
-    spinner: true,
-    actions: [{ label: 'Cancel', onClick: async () => {
-      await window.forge.setupCancel();
-      hideSetup();
-      await refreshAuth();
-    } }],
-  });
-  const result = await window.forge.setupLogin();
-  await refreshAuth();
-  if (result && result.ok && state.auth.loggedIn) {
-    showSetup({ title: 'Connected!', sub: 'All set.', spinner: false });
-    setTimeout(() => hideSetup(), 900);
-  } else {
-    showSetup({
-      title: 'Sign-in didn\'t finish',
-      sub: 'The sign-in step didn\'t complete.',
-      error: result?.error || 'Unknown error.',
-      details: result?.details,
+  // The subprocess runs in the background. Its exit is not our completion signal —
+  // `claude auth status --json` is. We forward user-pasted codes to its stdin via
+  // setup:submitCode, and poll auth status until it flips to true.
+  let cancelled = false;
+  const loginPromise = window.forge.setupLogin().catch((e) => ({ ok: false, error: e.message }));
+
+  const doCancel = async () => {
+    cancelled = true;
+    await window.forge.setupCancel();
+    hideSetup();
+    await refreshAuth();
+  };
+
+  const showPasteStep = (opts = {}) => {
+    let inputRef = null;
+    const rendered = showSetup({
+      title: 'Sign in to Anthropic',
+      sub: opts.sub ||
+        'Your browser is opening. Sign in with your Anthropic account, then copy the code shown on the "Paste this in Claude Code" page and paste it below.',
+      spinner: false,
+      error: opts.error,
+      codeInput: {
+        label: 'Authorization code',
+        placeholder: 'Paste the code from your browser',
+        value: opts.keepValue || '',
+      },
       actions: [
-        { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
-        { label: 'Try again', primary: true, onClick: promptSignIn },
-        { label: 'Close', onClick: () => hideSetup() },
+        {
+          label: 'Sign in',
+          primary: true,
+          onClick: async () => {
+            const val = (inputRef?.value || '').trim();
+            if (!val) { inputRef?.focus(); return; }
+            await handleCodeSubmit(val);
+          },
+        },
+        { label: 'Cancel', onClick: doCancel },
       ],
     });
+    inputRef = rendered.inputEl;
+  };
+
+  const handleCodeSubmit = async (code) => {
+    showSetup({
+      title: 'Verifying…',
+      sub: 'Checking your sign-in with Anthropic.',
+      spinner: true,
+      actions: [{ label: 'Cancel', onClick: doCancel }],
+    });
+
+    const submit = await window.forge.setupSubmitCode(code);
+    if (!submit.ok) {
+      showPasteStep({
+        error: submit.error || 'Could not send the code to the sign-in helper.',
+        sub: 'That didn\'t work — copy the code again and paste it here.',
+      });
+      return;
+    }
+
+    // Poll auth status for up to 30s. The CLI processes the code, updates
+    // its config, and `claude auth status --json` flips loggedIn -> true.
+    for (let i = 0; i < 15; i++) {
+      if (cancelled) return;
+      await new Promise((r) => setTimeout(r, 2000));
+      const auth = await refreshAuth({ silent: true });
+      if (auth.loggedIn) {
+        showSetup({ title: 'Connected!', sub: 'All set.', spinner: false });
+        setTimeout(() => hideSetup(), 900);
+        return;
+      }
+    }
+
+    // Didn't verify — the code was probably wrong or the CLI is still waiting.
+    // Fall back to the paste field so the user can try again without a fresh
+    // OAuth round-trip (the subprocess is still alive and still on the same URL).
+    showPasteStep({
+      error: 'That code didn\'t verify. It may be expired or mistyped. Copy it again and try once more.',
+    });
+  };
+
+  // First render immediately — user can start pasting as soon as their browser shows the code.
+  showPasteStep();
+
+  // If the subprocess dies for any reason and we haven't succeeded, surface that
+  // (bad exit + still not authed = tell the user, don't spin forever).
+  const result = await loginPromise;
+  if (cancelled) return;
+  const finalAuth = await refreshAuth({ silent: true });
+  if (finalAuth.loggedIn) {
+    // Already showing "Connected!" from the poll — nothing to do.
+    return;
   }
+  // Subprocess exited but we're still not signed in. Show a real error.
+  showSetup({
+    title: 'Sign-in didn\'t finish',
+    sub: 'The sign-in helper ended before Forge could confirm your login.',
+    error: result?.error || 'Unknown error.',
+    details: result?.details,
+    actions: [
+      { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
+      { label: 'Try again', primary: true, onClick: promptSignIn },
+      { label: 'Close', onClick: () => hideSetup() },
+    ],
+  });
 }
 
 /* ---------- Setup flow ---------- */
-function showSetup({ title, sub, spinner = false, error = null, details = null, actions = [] }) {
+function showSetup({ title, sub, spinner = false, error = null, details = null, actions = [], codeInput = null }) {
   $('setup-overlay').hidden = false;
   $('setup-title').textContent = title || '';
   $('setup-sub').textContent = sub || '';
@@ -662,6 +737,40 @@ function showSetup({ title, sub, spinner = false, error = null, details = null, 
   }
   const actionsEl = $('setup-actions');
   actionsEl.innerHTML = '';
+
+  let inputEl = null;
+  if (codeInput) {
+    const wrap = document.createElement('div');
+    wrap.className = 'setup-code-input';
+    if (codeInput.label) {
+      const lab = document.createElement('label');
+      lab.textContent = codeInput.label;
+      lab.htmlFor = 'setup-code-field';
+      wrap.appendChild(lab);
+    }
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = 'setup-code-field';
+    input.placeholder = codeInput.placeholder || '';
+    input.spellcheck = false;
+    input.autocomplete = 'off';
+    input.autocapitalize = 'off';
+    if (codeInput.value) input.value = codeInput.value;
+    wrap.appendChild(input);
+    actionsEl.appendChild(wrap);
+    inputEl = input;
+    // Focus + select next tick so paste-then-Enter works immediately.
+    setTimeout(() => { try { input.focus(); input.select(); } catch {} }, 30);
+    // Enter submits the primary action if present.
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const primary = actions.find((a) => a.primary);
+        if (primary) primary.onClick();
+      }
+    });
+  }
+
   for (const a of actions) {
     const btn = document.createElement('button');
     btn.className = 'setup-btn' + (a.primary ? ' primary' : '');
@@ -669,6 +778,7 @@ function showSetup({ title, sub, spinner = false, error = null, details = null, 
     btn.addEventListener('click', a.onClick);
     actionsEl.appendChild(btn);
   }
+  return { inputEl };
 }
 
 function hideSetup() {
@@ -750,49 +860,14 @@ async function runSetup() {
     }
   }
 
-  showSetup({
-    title: 'Almost there — sign in',
-    sub: 'Your web browser should open in a moment. Sign in with Anthropic there, then come back to this window.',
-    spinner: true,
-    actions: [{ label: 'Cancel', onClick: async () => {
-      await window.forge.setupCancel();
-      showSetup({
-        title: 'Sign-in cancelled',
-        sub: 'You can try again whenever you\'re ready.',
-        actions: [{ label: 'Try again', primary: true, onClick: runSetup }],
-      });
-    } }],
-  });
-  const login = await window.forge.setupLogin();
-  if (!login.ok) {
-    showSetup({
-      title: 'Sign-in didn\'t finish',
-      sub: 'The sign-in step didn\'t complete.',
-      error: login.error,
-      details: login.details,
-      actions: [
-        { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
-        { label: 'Try again', primary: true, onClick: runSetup },
-      ],
-    });
-    return;
-  }
-
-  // Seed and render the auth indicator from setupLogin's returned auth block.
-  if (login.auth) {
-    state.auth = { ...login.auth, checking: false };
-  } else {
-    await refreshAuth({ silent: true });
-  }
-  renderAuth();
-  showSetup({
-    title: 'Connected!',
-    sub: 'All set. Opening Forge…',
-  });
-  setTimeout(() => {
-    hideSetup();
+  // Run the same paste-in sign-in flow used by the top-bar indicator.
+  await promptSignIn();
+  // promptSignIn manages its own success/failure UI. If it succeeded, auth
+  // state will be loggedIn and the overlay will already be closed.
+  const auth = await refreshAuth({ silent: true });
+  if (auth.loggedIn) {
     renderLanding();
-  }, 1000);
+  }
 }
 
 window.forge.onSetupProgress(() => {

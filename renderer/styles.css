@@ -583,6 +583,36 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   margin-top: 20px;
   flex-wrap: wrap;
   justify-content: center;
+  align-items: center;
+}
+.setup-code-input {
+  flex: 0 0 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+  margin-bottom: 6px;
+}
+.setup-code-input label {
+  color: #8b93a7;
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.setup-code-input input {
+  width: 100%;
+  padding: 10px 12px;
+  background: #0f1115;
+  color: #e6e8ee;
+  border: 1px solid #22283a;
+  border-radius: 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+}
+.setup-code-input input:focus {
+  outline: none;
+  border-color: #4c8bff;
 }
 .setup-btn {
   padding: 10px 20px;

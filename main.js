@@ -590,13 +590,10 @@ function runAuthLogin() {
       return;
     }
     setupChild = child;
-
-    // Some CLIs pause on "Press Enter to open browser" when they detect no TTY.
-    // Send a few CRs at startup so any such prompt gets past. Best-effort.
-    try {
-      child.stdin?.write('\r\n\r\n');
-      child.stdin?.end();
-    } catch {}
+    // IMPORTANT: keep stdin OPEN. The CLI's OAuth flow uses an
+    // authorization-code paste-back model — after the user completes the
+    // browser flow, it waits on stdin for the code to be pasted. We forward
+    // that code via the `setup:submitCode` IPC handler below.
 
     let combined = '';
     let urlOpened = false;
@@ -665,6 +662,24 @@ function runAuthLogin() {
     });
   });
 }
+
+ipcMain.handle('setup:submitCode', async (_e, code) => {
+  if (!setupChild || !setupChild.stdin || setupChild.stdin.destroyed) {
+    return { ok: false, error: 'The sign-in helper is not currently running.' };
+  }
+  const trimmed = String(code || '').trim();
+  if (!trimmed) return { ok: false, error: 'Please paste the code first.' };
+  try {
+    // Newline commits the paste in every stdin-driven CLI prompt library
+    // (readline, prompts, inquirer, clack).
+    setupChild.stdin.write(trimmed + '\n');
+    appendLog(`[stdin] <code submitted, length=${trimmed.length}>\n`);
+    return { ok: true };
+  } catch (e) {
+    appendLog(`[stdin write error] ${e.message}\n`);
+    return { ok: false, error: e.message };
+  }
+});
 
 ipcMain.handle('setup:cancel', () => {
   if (setupChild) {

@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('forge', {
   setupInstall: () => ipcRenderer.invoke('setup:install'),
   setupLogin: () => ipcRenderer.invoke('setup:login'),
   setupCancel: () => ipcRenderer.invoke('setup:cancel'),
+  setupSubmitCode: (code) => ipcRenderer.invoke('setup:submitCode', code),
   setupRevealLog: () => ipcRenderer.invoke('setup:revealLog'),
   chatRevealLog: () => ipcRenderer.invoke('chat:revealLog'),
   onSetupProgress: (cb) => ipcRenderer.on('setup:progress', (_e, data) => cb(data)),
