@@ -8,6 +8,8 @@ const state = {
   recent: new Set(),
   pendingTools: new Map(),
   currentTrail: null,
+  auth: { loggedIn: false, reason: 'unknown' },
+  authPollHandle: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -352,6 +354,14 @@ async function sendPrompt() {
   }
   if (state.session) return;
 
+  // Authoritative pre-send auth check. Never spawn a chat we know will fail.
+  const auth = await refreshAuth({ silent: true });
+  if (!auth.loggedIn) {
+    addMessage('system', 'You\'re not signed in yet — Forge can\'t send this message.');
+    await promptSignIn();
+    return;
+  }
+
   addMessage('user', text);
   inputEl.value = '';
   startTrail();
@@ -361,6 +371,16 @@ async function sendPrompt() {
   const res = await window.forge.startClaude(state.folder, promptWithContext, state.claudeSessionId);
   if (!res || !res.ok) {
     const reason = res?.reason || 'unknown';
+    if (reason === 'not_authenticated') {
+      // Auth expired between the pre-check and the spawn call.
+      state.auth = { ...(res.auth || {}), checking: false };
+      renderAuth();
+      addStep('🔒', 'Not signed in — please sign in and try again.', 'error');
+      endTrail();
+      setRunning(false);
+      await promptSignIn();
+      return;
+    }
     const msg = res?.message ? `${reason}: ${res.message}` : reason;
     addStep('❌', 'Could not start Claude (' + msg + ').', 'error');
     if (reason === 'spawn_failed') {
@@ -517,6 +537,101 @@ $('clear-selection').addEventListener('click', () => {
   updateSelectionPill();
 });
 
+/* ---------- Auth indicator (single source of truth) ---------- */
+
+function renderAuth() {
+  const indicator = $('auth-indicator');
+  const dot = $('auth-dot');
+  const text = $('auth-text');
+  const btn = $('auth-signin');
+  if (!indicator) return;
+  indicator.classList.remove('state-connected', 'state-signed-out', 'state-checking', 'state-error');
+  const a = state.auth || {};
+  if (a.checking) {
+    indicator.classList.add('state-checking');
+    text.textContent = 'Checking…';
+    btn.hidden = true;
+    return;
+  }
+  if (a.loggedIn) {
+    indicator.classList.add('state-connected');
+    const parts = ['Connected'];
+    if (a.email) parts.push('as ' + a.email);
+    if (a.subscriptionType) parts.push('(' + a.subscriptionType + ')');
+    text.textContent = parts.join(' ');
+    btn.hidden = true;
+    return;
+  }
+  if (a.reason === 'no_bin') {
+    indicator.classList.add('state-error');
+    text.textContent = 'Claude Code not found';
+    btn.hidden = false;
+    btn.textContent = 'Set up';
+    return;
+  }
+  indicator.classList.add('state-signed-out');
+  text.textContent = 'Not signed in';
+  btn.hidden = false;
+  btn.textContent = 'Sign in';
+}
+
+async function refreshAuth({ silent = false } = {}) {
+  if (!silent) {
+    state.auth = { ...state.auth, checking: true };
+    renderAuth();
+  }
+  try {
+    const auth = await window.forge.authStatus();
+    state.auth = { ...auth, checking: false };
+  } catch (e) {
+    state.auth = { loggedIn: false, reason: 'unknown', error: e.message, checking: false };
+  }
+  renderAuth();
+  return state.auth;
+}
+
+function startAuthPolling() {
+  if (state.authPollHandle) return;
+  // Recheck every 60s so a silently-expired login is caught.
+  state.authPollHandle = setInterval(() => {
+    // Skip polling while a chat session is active — the pre-send check covers that.
+    if (state.session) return;
+    refreshAuth({ silent: true });
+  }, 60 * 1000);
+}
+
+async function promptSignIn() {
+  // Reuse the setup overlay to run the same login flow.
+  showSetup({
+    title: 'Sign in to Anthropic',
+    sub: 'Your web browser should open in a moment. Sign in there, then come back to this window.',
+    spinner: true,
+    actions: [{ label: 'Cancel', onClick: async () => {
+      await window.forge.setupCancel();
+      hideSetup();
+      await refreshAuth();
+    } }],
+  });
+  const result = await window.forge.setupLogin();
+  await refreshAuth();
+  if (result && result.ok && state.auth.loggedIn) {
+    showSetup({ title: 'Connected!', sub: 'All set.', spinner: false });
+    setTimeout(() => hideSetup(), 900);
+  } else {
+    showSetup({
+      title: 'Sign-in didn\'t finish',
+      sub: 'The sign-in step didn\'t complete.',
+      error: result?.error || 'Unknown error.',
+      details: result?.details,
+      actions: [
+        { label: 'Show setup log', onClick: () => window.forge.setupRevealLog() },
+        { label: 'Try again', primary: true, onClick: promptSignIn },
+        { label: 'Close', onClick: () => hideSetup() },
+      ],
+    });
+  }
+}
+
 /* ---------- Setup flow ---------- */
 function showSetup({ title, sub, spinner = false, error = null, details = null, actions = [] }) {
   $('setup-overlay').hidden = false;
@@ -576,6 +691,13 @@ async function runSetup() {
   }
 
   if (!status.needsSetup) {
+    // Seed the auth indicator from the same round-trip.
+    if (status.auth) {
+      state.auth = { ...status.auth, checking: false };
+      renderAuth();
+    } else {
+      refreshAuth({ silent: true });
+    }
     hideSetup();
     renderLanding();
     return;
@@ -656,6 +778,13 @@ async function runSetup() {
     return;
   }
 
+  // Seed and render the auth indicator from setupLogin's returned auth block.
+  if (login.auth) {
+    state.auth = { ...login.auth, checking: false };
+  } else {
+    await refreshAuth({ silent: true });
+  }
+  renderAuth();
   showSetup({
     title: 'Connected!',
     sub: 'All set. Opening Forge…',
@@ -670,7 +799,18 @@ window.forge.onSetupProgress(() => {
   // reserved for progress hints; overlay copy is intentionally stable to avoid flicker
 });
 
+renderAuth();
+startAuthPolling();
 runSetup();
+
+$('auth-signin').addEventListener('click', async () => {
+  // Button label depends on state: no CLI → run full setup; otherwise pure sign-in.
+  if (state.auth.reason === 'no_bin') {
+    await runSetup();
+  } else {
+    await promptSignIn();
+  }
+});
 
 window.forge.onEvent(({ event }) => handleEvent(event));
 

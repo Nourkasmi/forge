@@ -44,6 +44,11 @@
       <main id="chat">
         <header class="chat-header">
           <div class="brand"><span class="brand-mark">◆</span> Forge</div>
+          <div class="auth-indicator" id="auth-indicator" title="Authentication status">
+            <span class="auth-dot" id="auth-dot"></span>
+            <span class="auth-text" id="auth-text">Checking…</span>
+            <button class="auth-signin" id="auth-signin" hidden>Sign in</button>
+          </div>
           <div class="header-right">
             <button id="new-chat" class="secondary" title="Start a fresh conversation">New chat</button>
             <div class="status" id="status">Idle</div>

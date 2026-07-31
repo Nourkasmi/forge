@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('forge', {
   info: () => ipcRenderer.invoke('app:info'),
   commonPaths: () => ipcRenderer.invoke('app:commonPaths'),
+  authStatus: () => ipcRenderer.invoke('auth:status'),
   openFolder: () => ipcRenderer.invoke('dialog:openFolder'),
   listFolder: (p) => ipcRenderer.invoke('fs:listFolder', p),
   parentFolder: (p) => ipcRenderer.invoke('fs:parent', p),

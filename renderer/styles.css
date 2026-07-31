@@ -261,6 +261,53 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   align-items: center;
   gap: 12px;
 }
+
+.auth-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #171b28;
+  border: 1px solid #22283a;
+  font-size: 12.5px;
+  color: #cfd3df;
+  min-height: 26px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.auth-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6a7189;
+  flex: 0 0 auto;
+}
+.auth-indicator.state-connected .auth-dot { background: #4ade80; box-shadow: 0 0 6px rgba(74, 222, 128, 0.5); }
+.auth-indicator.state-signed-out .auth-dot { background: #ef4444; }
+.auth-indicator.state-checking .auth-dot { background: #eab308; animation: auth-pulse 1s ease-in-out infinite; }
+.auth-indicator.state-error .auth-dot { background: #ef4444; }
+@keyframes auth-pulse { 50% { opacity: 0.4; } }
+
+.auth-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.auth-signin {
+  background: #2b6de5;
+  color: white;
+  border: 0;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.auth-signin:hover { background: #3a7ff5; }
 .status {
   font-size: 12.5px;
   color: #8b93a7;

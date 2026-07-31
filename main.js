@@ -280,51 +280,71 @@ async function findClaudeAfterInstall() {
   return { ok: false, error: 'Installed, but the claude binary was not found on disk.' };
 }
 
-async function isAuthenticated() {
-  const tmpCwd = os.tmpdir();
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawnClaude(['-p', 'ok', '--output-format', 'stream-json', '--verbose'], {
-        cwd: tmpCwd,
-      });
-    } catch {
-      resolve(false);
-      return;
-    }
-    let sawResult = false;
-    let sawAuthError = false;
-    const buffer = { s: '' };
-    const timer = setTimeout(() => killChildTree(child), 15000);
-    child.stdout.on('data', (d) => {
-      buffer.s += d.toString('utf8');
-      let nl;
-      while ((nl = buffer.s.indexOf('\n')) >= 0) {
-        const line = buffer.s.slice(0, nl);
-        buffer.s = buffer.s.slice(nl + 1);
-        if (!line.trim()) continue;
-        try {
-          const evt = JSON.parse(line);
-          if (evt.type === 'result' && !evt.is_error) sawResult = true;
-          if (evt.type === 'result' && evt.is_error) sawAuthError = true;
-        } catch {}
-      }
+/**
+ * Authoritative auth check via `claude auth status --json`.
+ * Returns { loggedIn, email?, subscriptionType?, authMethod?, error?, reason? }.
+ * `reason` is a stable code for the renderer to branch on:
+ *   - 'ok'         loggedIn = true
+ *   - 'no_bin'     claude binary is missing or unusable
+ *   - 'no_auth'    binary works, user isn't signed in
+ *   - 'unknown'    something else went wrong
+ */
+async function checkAuthStatus() {
+  let child;
+  try {
+    child = spawnClaude(['auth', 'status', '--json'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-    child.stderr.on('data', (d) => {
-      const s = d.toString('utf8').toLowerCase();
-      if (/(not authenticated|invalid.*api key|401|log ?in|sign ?in|please run|no api key)/i.test(s)) {
-        sawAuthError = true;
-      }
+  } catch (e) {
+    return { loggedIn: false, reason: 'no_bin', error: e.message };
+  }
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => killChildTree(child), 10000);
+    child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+    child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ loggedIn: false, reason: 'no_bin', error: err.message });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      resolve(sawResult && !sawAuthError && code === 0);
-    });
-    child.on('error', () => {
-      clearTimeout(timer);
-      resolve(false);
+      const combined = (stdout + stderr).trim();
+      // Try to find the JSON payload inside whatever the CLI printed.
+      const match = stdout.match(/\{[\s\S]*\}/);
+      if (match) {
+        try {
+          const parsed = JSON.parse(match[0]);
+          if (parsed && typeof parsed.loggedIn === 'boolean') {
+            return resolve({
+              loggedIn: parsed.loggedIn,
+              email: parsed.email || null,
+              authMethod: parsed.authMethod || null,
+              subscriptionType: parsed.subscriptionType || null,
+              orgName: parsed.orgName || null,
+              reason: parsed.loggedIn ? 'ok' : 'no_auth',
+            });
+          }
+        } catch {}
+      }
+      // Fall back to string heuristics.
+      if (/not (logged|signed) in|no.*auth|please (log|sign) in/i.test(combined)) {
+        return resolve({ loggedIn: false, reason: 'no_auth', error: combined.slice(0, 400) });
+      }
+      if (code === 0) {
+        // Command succeeded but we couldn't parse — treat as unknown, don't lie.
+        return resolve({ loggedIn: false, reason: 'unknown', error: combined.slice(0, 400) || 'auth status returned no parseable output' });
+      }
+      resolve({ loggedIn: false, reason: 'unknown', error: combined.slice(0, 400) || `auth status exit ${code}` });
     });
   });
+}
+
+// Back-compat shim for older callers.
+async function isAuthenticated() {
+  const s = await checkAuthStatus();
+  return s.loggedIn;
 }
 
 function createWindow() {
@@ -367,6 +387,12 @@ app.on('activate', () => {
 
 ipcMain.handle('app:info', () => ({ claudeBin: CLAUDE_BIN, home: process.env.HOME }));
 
+ipcMain.handle('auth:status', async () => {
+  // Cheap when there's no binary yet; the CLI path is validated up-front.
+  if (!CLAUDE_BIN) return { loggedIn: false, reason: 'no_bin' };
+  return await checkAuthStatus();
+});
+
 ipcMain.handle('setup:status', async () => {
   if (process.env.FORGE_FORCE_SETUP) {
     const npm = await probeNpm();
@@ -375,7 +401,15 @@ ipcMain.handle('setup:status', async () => {
   const claude = await probeClaude();
   if (claude.ok) {
     CLAUDE_BIN = claude.bin;
-    return { needsSetup: false, hasClaude: true, claudeVersion: claude.version };
+    // Also fold in an authoritative auth check — a "hasClaude but not signed in"
+    // state is a real one and the renderer wants to know without a second RTT.
+    const auth = await checkAuthStatus();
+    return {
+      needsSetup: false,
+      hasClaude: true,
+      claudeVersion: claude.version,
+      auth,
+    };
   }
   const npm = await probeNpm();
   return { needsSetup: true, hasClaude: false, hasNpm: npm.ok, npmVersion: npm.version };
@@ -487,112 +521,57 @@ ipcMain.handle('setup:login', async () => {
     killChildTree(setupChild);
     setupChild = null;
   }
-  logHeader('sign-in flow');
+  logHeader('sign-in flow (claude auth login --claudeai)');
   appendLog(`claude bin: ${CLAUDE_BIN}\n`);
 
-  const already = await isAuthenticated();
-  appendLog(`pre-check isAuthenticated: ${already}\n`);
-  if (already) return { ok: true };
+  const already = await checkAuthStatus();
+  appendLog(`pre-check: ${JSON.stringify(already)}\n`);
+  if (already.loggedIn) return { ok: true, auth: already };
 
-  const first = await runLoginCommand();
-  appendLog(`\n--- runLoginCommand summary ---\nok=${first.ok} exitCode=${first.code ?? '?'} tookMs=${first.tookMs ?? '?'}\n`);
+  const result = await runAuthLogin();
+  appendLog(`\n--- runAuthLogin summary ---\nok=${result.ok} exitCode=${result.code ?? '?'} killedForAuth=${result.killedForAuth ?? false}\n`);
 
-  const firstAuthed = await isAuthenticated();
-  appendLog(`post-first isAuthenticated: ${firstAuthed}\n`);
-  if (firstAuthed) return { ok: true };
-
-  const interactive = await runInteractiveLogin();
-  appendLog(`\n--- runInteractiveLogin summary ---\nok=${interactive.ok} exitCode=${interactive.code ?? '?'} killedForAuth=${interactive.killedForAuth ?? false}\n`);
-
-  const finalAuthed = await isAuthenticated();
-  appendLog(`post-interactive isAuthenticated: ${finalAuthed}\n`);
-  if (finalAuthed) return { ok: true };
+  const finalStatus = await checkAuthStatus();
+  appendLog(`post-login: ${JSON.stringify(finalStatus)}\n`);
+  if (finalStatus.loggedIn) return { ok: true, auth: finalStatus };
 
   const details = [
-    '--- Attempt 1: "claude login" ---',
-    `argv: ${CLAUDE_BIN} login`,
-    `exit code: ${first.code ?? '(no exit)'}`,
-    `stdout:\n${(first.stdout || '(empty)').trim()}`,
-    `stderr:\n${(first.stderr || '(empty)').trim()}`,
+    'Command: claude auth login --claudeai',
+    `Bin: ${CLAUDE_BIN}`,
+    `Exit code: ${result.code ?? '(killed)'}`,
+    `Killed by us after successful auth: ${result.killedForAuth ?? false}`,
     '',
-    '--- Attempt 2: interactive claude ---',
-    `argv: ${CLAUDE_BIN}`,
-    `exit code: ${interactive.code ?? '(killed)'}`,
-    `output:\n${(interactive.combined || '(empty)').trim()}`,
-  ].join('\n').slice(-4000);
+    '--- Subprocess output (last 3KB) ---',
+    (result.combined || '(no output captured)').slice(-3000),
+    '',
+    '--- Final auth status probe ---',
+    JSON.stringify(finalStatus, null, 2),
+  ].join('\n');
 
   return {
     ok: false,
     error: 'Sign-in did not complete. Please try again, or open the setup log for details.',
     details,
     logPath: getLogPath(),
+    authReason: finalStatus.reason,
   };
 });
 
-function runLoginCommand() {
+/**
+ * Drive `claude auth login --claudeai` — the CLI's dedicated OAuth-via-browser
+ * command for Claude subscriptions. Unlike the interactive `claude` wizard,
+ * this subcommand:
+ *   - is scriptable (doesn't require a real TTY for the login step itself)
+ *   - prints its OAuth URL to stdout in a stable format
+ *   - waits for the OAuth callback on a local port, then exits with code 0
+ *
+ * We open the URL in the OS browser as soon as we see it, and poll
+ * `claude auth status --json` for authoritative completion — the subprocess
+ * exit code is treated as informational only.
+ */
+function runAuthLogin() {
   return new Promise((resolve) => {
-    appendLog(`\n>>> spawn: ${CLAUDE_BIN} login\n`);
-    const startedAt = Date.now();
-    let child;
-    try {
-      child = spawnClaude(['login'], { stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (err) {
-      appendLog(`spawn threw: ${err.message}\n`);
-      resolve({ ok: false, code: -1, stdout: '', stderr: err.message, tookMs: Date.now() - startedAt });
-      return;
-    }
-    setupChild = child;
-    let stdout = '';
-    let stderr = '';
-    let urlOpened = false;
-
-    const scan = (chunk) => {
-      if (urlOpened) return;
-      const m = (stdout + stderr).match(/https?:\/\/[^\s\r\n"'`]+/);
-      if (m) {
-        urlOpened = true;
-        appendLog(`[detected url] ${m[0]}\n`);
-        shell.openExternal(m[0]).catch(() => {});
-        sendToRenderer('setup:progress', { phase: 'loggingIn', urlOpened: true });
-      }
-    };
-    child.stdout.on('data', (d) => {
-      const s = d.toString('utf8');
-      stdout += s;
-      appendLog(`[stdout] ${s}`);
-      scan();
-    });
-    child.stderr.on('data', (d) => {
-      const s = d.toString('utf8');
-      stderr += s;
-      appendLog(`[stderr] ${s}`);
-      scan();
-    });
-
-    const HARD_TIMEOUT_MS = 10 * 60 * 1000;
-    const timeout = setTimeout(() => {
-      appendLog(`\n[timeout after ${HARD_TIMEOUT_MS}ms] killing child\n`);
-      killChildTree(child);
-    }, HARD_TIMEOUT_MS);
-
-    child.on('error', (e) => {
-      clearTimeout(timeout);
-      setupChild = null;
-      appendLog(`[child error] ${e.message}\n`);
-      resolve({ ok: false, code: -1, stdout, stderr: stderr + '\n' + e.message, tookMs: Date.now() - startedAt });
-    });
-    child.on('close', (code) => {
-      clearTimeout(timeout);
-      setupChild = null;
-      appendLog(`[exit] code=${code}\n`);
-      resolve({ ok: code === 0, code, stdout, stderr, tookMs: Date.now() - startedAt });
-    });
-  });
-}
-
-function runInteractiveLogin() {
-  return new Promise((resolve) => {
-    appendLog(`\n>>> spawn interactive: ${CLAUDE_BIN} (no args)\n`);
+    appendLog(`\n>>> spawn: ${CLAUDE_BIN} auth login --claudeai\n`);
     let child;
     let settled = false;
     const finish = (payload) => {
@@ -601,8 +580,8 @@ function runInteractiveLogin() {
       resolve(payload);
     };
     try {
-      child = spawnClaude([], {
-        env: { ...process.env, FORCE_COLOR: '0', TERM: 'dumb', NO_COLOR: '1' },
+      child = spawnClaude(['auth', 'login', '--claudeai'], {
+        env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', TERM: 'dumb' },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
@@ -611,39 +590,50 @@ function runInteractiveLogin() {
       return;
     }
     setupChild = child;
+
+    // Some CLIs pause on "Press Enter to open browser" when they detect no TTY.
+    // Send a few CRs at startup so any such prompt gets past. Best-effort.
+    try {
+      child.stdin?.write('\r\n\r\n');
+      child.stdin?.end();
+    } catch {}
+
     let combined = '';
     let urlOpened = false;
-    const scan = () => {
+    const openUrlIfSeen = () => {
       if (urlOpened) return;
-      const m = combined.match(/https?:\/\/[^\s\r\n"'`]+/);
-      if (m) {
+      // Match any https URL; prefer known Anthropic hosts if multiple appear.
+      const urls = combined.match(/https?:\/\/[^\s\r\n"'`)>]+/g) || [];
+      const preferred = urls.find((u) => /anthropic|claude/i.test(u)) || urls[0];
+      if (preferred) {
         urlOpened = true;
-        appendLog(`[detected url] ${m[0]}\n`);
-        shell.openExternal(m[0]).catch(() => {});
-        sendToRenderer('setup:progress', { phase: 'loggingIn', urlOpened: true });
+        appendLog(`[detected url] ${preferred}\n`);
+        shell.openExternal(preferred).catch(() => {});
+        sendToRenderer('setup:progress', { phase: 'loggingIn', urlOpened: true, url: preferred });
       }
     };
+
     child.stdout.on('data', (d) => {
       const s = d.toString('utf8');
       combined += s;
       appendLog(`[stdout] ${s}`);
-      scan();
+      openUrlIfSeen();
     });
     child.stderr.on('data', (d) => {
       const s = d.toString('utf8');
       combined += s;
       appendLog(`[stderr] ${s}`);
-      scan();
+      openUrlIfSeen();
     });
 
     let doneChecks = 0;
-    const MAX_CHECKS = 60; // 5 min
+    const MAX_CHECKS = 60; // 5 min at 5s intervals
     const checkInterval = setInterval(async () => {
       if (settled) return;
       doneChecks++;
-      const ok = await isAuthenticated();
-      appendLog(`[poll ${doneChecks}] isAuthenticated=${ok}\n`);
-      if (ok) {
+      const status = await checkAuthStatus();
+      appendLog(`[poll ${doneChecks}] loggedIn=${status.loggedIn} reason=${status.reason}\n`);
+      if (status.loggedIn) {
         clearInterval(checkInterval);
         killChildTree(child);
         setupChild = null;
@@ -668,20 +658,12 @@ function runInteractiveLogin() {
       setupChild = null;
       appendLog(`[exit] code=${code} (after ${doneChecks} auth polls)\n`);
       if (settled) return;
-      // Give one last check in case OAuth completed as we exited
-      const ok = await isAuthenticated();
-      appendLog(`[final check] isAuthenticated=${ok}\n`);
-      finish({ ok, code, combined });
+      // One last authoritative check — the CLI may exit before our poll fires.
+      const status = await checkAuthStatus();
+      appendLog(`[final check] loggedIn=${status.loggedIn} reason=${status.reason}\n`);
+      finish({ ok: status.loggedIn, code, combined });
     });
   });
-}
-
-function friendlyLoginError(stderr, code) {
-  const s = (stderr || '').toLowerCase();
-  if (/network|econnrefused|enotfound|timeout/i.test(s)) {
-    return 'Could not reach Anthropic\'s sign-in servers. Check your internet and try again.';
-  }
-  return code ? `Sign-in stopped unexpectedly (code ${code}). Try again.` : 'Sign-in stopped unexpectedly. Try again.';
 }
 
 ipcMain.handle('setup:cancel', () => {
@@ -806,6 +788,14 @@ function sendToRenderer(channel, payload) {
 ipcMain.handle('claude:start', async (_e, { cwd, prompt, resumeSessionId }) => {
   if (!cwd || !fs.existsSync(cwd)) return { ok: false, reason: 'invalid_cwd' };
   if (!prompt || !prompt.trim()) return { ok: false, reason: 'empty_prompt' };
+
+  // Authoritative pre-flight: never spawn a chat if we know we're not signed in.
+  // This is the "single source of truth" contract — a stale login is caught
+  // here instead of surfacing as a cryptic subprocess error mid-turn.
+  const auth = await checkAuthStatus();
+  if (!auth.loggedIn) {
+    return { ok: false, reason: 'not_authenticated', auth };
+  }
 
   const sessionId = String(nextSessionId++);
   const args = [];
