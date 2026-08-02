@@ -863,7 +863,17 @@ ipcMain.handle('claude:start', async (_e, { cwd, prompt, resumeSessionId }) => {
   // no length limits from CreateProcess (~32k). Works identically on all OSes.
   const args = [];
   if (resumeSessionId) args.push('--resume', resumeSessionId);
-  args.push('-p', '--input-format', 'text', '--output-format', 'stream-json', '--verbose');
+  args.push(
+    '-p',
+    '--input-format', 'text',
+    '--output-format', 'stream-json',
+    '--verbose',
+    // Forge runs the CLI headlessly — there is no terminal for the user to
+    // approve mid-task permission prompts. Without this flag the agent
+    // stops and gives up on any risky operation (shell commands, writes
+    // outside its immediate cwd, etc.).
+    '--dangerously-skip-permissions',
+  );
 
   const started = Date.now();
   appendChatLog(`\n===== ${new Date().toISOString()} — session ${sessionId} =====\ncwd=${cwd} bin=${CLAUDE_BIN} resume=${resumeSessionId || '(none)'}\n`);
